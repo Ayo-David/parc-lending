@@ -241,7 +241,48 @@ export class CustomerLendingService {
         })
         .first();
       if (!row) throw new Error("Customer loan application not found");
-      return row;
+      const decision = await tx("loan_application_decisions")
+        .where({
+          tenant_id: input.tenantId,
+          application_id: input.applicationId,
+        })
+        .orderBy("decided_at", "desc")
+        .first("decision", "reason_codes");
+      const offer = await tx("loan_offers")
+        .where({
+          tenant_id: input.tenantId,
+          application_id: input.applicationId,
+          status: "ISSUED",
+        })
+        .first("id");
+      const underwritingStatus = String(
+        row.underwriting_status ?? "PENDING_EVIDENCE",
+      );
+      return {
+        id: row.id,
+        application_number: row.application_number,
+        product_version_id: row.loan_product_version_id,
+        requested_amount_minor: String(row.requested_amount),
+        requested_tenure_days: row.requested_tenure_days,
+        currency: String(row.currency).trim(),
+        status: row.status,
+        underwriting_status: underwritingStatus,
+        submitted_at: row.submitted_at,
+        customer_reason_codes: Array.isArray(decision?.reason_codes)
+          ? decision.reason_codes
+          : [],
+        next_action: offer
+          ? "REVIEW_OFFER"
+          : underwritingStatus === "ACTION_REQUIRED"
+            ? "PROVIDE_INFORMATION"
+            : underwritingStatus === "MANUAL_REVIEW"
+              ? "WAIT_FOR_REVIEW"
+              : ["REJECTED", "CANCELLED", "EXPIRED"].includes(
+                    String(row.status),
+                  )
+                ? "NONE"
+                : "WAIT",
+      };
     });
   }
 

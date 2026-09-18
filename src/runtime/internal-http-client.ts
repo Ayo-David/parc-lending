@@ -91,14 +91,39 @@ export class InternalHttpClient
     };
   }
 
+  public getLendingEligibility(input: {
+    tenantId: string;
+    customerId: string;
+    consentReference: string;
+  }): Promise<Record<string, unknown>> {
+    const query = new URLSearchParams({
+      consent_reference: input.consentReference,
+    });
+    return this.request<Record<string, unknown>>(
+      `${this.config.authCustomerUrl}/internal/v1/tenants/${input.tenantId}/customers/${input.customerId}/lending-eligibility?${query.toString()}`,
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${this.config.serviceToken}`,
+          "x-service-name": "parc-lending",
+          "x-tenant-id": input.tenantId,
+        },
+      },
+    );
+  }
+
   private async request<T>(
     url: string,
-    input: { headers: Record<string, string>; body: object },
+    input: {
+      headers: Record<string, string>;
+      body?: object;
+      method?: "GET" | "POST";
+    },
   ): Promise<T> {
     const response = await fetch(url, {
-      method: "POST",
+      method: input.method ?? "POST",
       headers: { "content-type": "application/json", ...input.headers },
-      body: JSON.stringify(input.body),
+      ...(input.body ? { body: JSON.stringify(input.body) } : {}),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     const body: unknown = await response.json();

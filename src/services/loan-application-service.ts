@@ -28,7 +28,14 @@ export interface UnderwritingEvidence {
   monthlyIncomeMinor: string;
   existingExposureMinor: string;
   activeLoanCount: number;
-  fraudFlag: boolean;
+  riskDisposition: "CLEAR" | "REFER" | "BLOCK";
+}
+export interface LendingEligibilityGateway {
+  getLendingEligibility(input: {
+    tenantId: string;
+    customerId: string;
+    consentReference: string;
+  }): Promise<Record<string, unknown>>;
 }
 type RuleOutcome = "PASS" | "FAIL" | "REFER";
 interface RuleResult {
@@ -38,9 +45,16 @@ interface RuleResult {
   reason: string;
   observedHash: string;
 }
+interface EvidenceCollectionResult {
+  evidence: UnderwritingEvidence;
+  status: "READY" | "ACTION_REQUIRED";
+}
 
 export class LoanApplicationService {
-  constructor(private readonly db: Knex) {}
+  constructor(
+    private readonly db: Knex,
+    private readonly eligibility?: LendingEligibilityGateway,
+  ) {}
   async submit(input: {
     tenantId: string;
     customerId: string;
@@ -48,99 +62,340 @@ export class LoanApplicationService {
     amountMinor: string;
     tenureDays: number;
     purpose: string;
-    evidence: UnderwritingEvidence;
+    consentReference: string;
+    declaredMonthlyIncomeMinor: string;
     idempotencyKey: string;
     correlationId: string;
-  }): Promise<{ id: string; status: "SUBMITTED"; replayed: boolean }> {
+  }): Promise<{
+    id: string;
+    applicationNumber: string;
+    submittedAt: string;
+    status: "SUBMITTED";
+    underwritingStatus: "PENDING_EVIDENCE" | "READY" | "ACTION_REQUIRED";
+    replayed: boolean;
+  }> {
     validateSubmission(input);
-    return withTenantTransaction(this.db, input.tenantId, async (tx) => {
-      const requestHash = hash({
-        customerId: input.customerId,
-        productVersionId: input.productVersionId,
-        amountMinor: input.amountMinor,
-        tenureDays: input.tenureDays,
-        purpose: input.purpose,
-        evidence: input.evidence,
-      });
-      const existing = await tx("loan_applications")
-        .where({
+    const submitted = await withTenantTransaction(
+      this.db,
+      input.tenantId,
+      async (tx) => {
+        const requestHash = hash({
+          customerId: input.customerId,
+          productVersionId: input.productVersionId,
+          amountMinor: input.amountMinor,
+          tenureDays: input.tenureDays,
+          purpose: input.purpose,
+          consentReference: input.consentReference,
+          declaredMonthlyIncomeMinor: input.declaredMonthlyIncomeMinor,
+        });
+        const existing = await tx("loan_applications")
+          .where({
+            tenant_id: input.tenantId,
+            idempotency_key: input.idempotencyKey,
+          })
+          .first<{
+            id: string;
+            application_number: string;
+            submitted_at: Date;
+            request_hash: string;
+            underwriting_status:
+              "PENDING_EVIDENCE" | "READY" | "ACTION_REQUIRED";
+          }>();
+        if (existing) {
+          if (existing.request_hash !== requestHash)
+            throw new Error(
+              "Idempotency key reused with different application",
+            );
+          return {
+            id: existing.id,
+            applicationNumber: existing.application_number,
+            submittedAt: existing.submitted_at.toISOString(),
+            status: "SUBMITTED" as const,
+            underwritingStatus: existing.underwriting_status,
+            replayed: true,
+          };
+        }
+        const version = await tx("loan_product_versions")
+          .where({
+            tenant_id: input.tenantId,
+            id: input.productVersionId,
+            status: "PUBLISHED",
+            is_current: true,
+            activated_for_tenant: true,
+            currency: "NGN",
+          })
+          .first<PublishedVersion>();
+        if (!version)
+          throw new Error("Published loan product version is unavailable");
+        if (
+          BigInt(input.amountMinor) < BigInt(version.min_amount) ||
+          BigInt(input.amountMinor) > BigInt(version.max_amount) ||
+          input.tenureDays < version.min_tenure_days ||
+          input.tenureDays > version.max_tenure_days
+        )
+          throw new Error("Requested terms are outside product boundaries");
+        const id = randomUUID();
+        const applicationNumber = `APP-${id}`;
+        const submittedAt = new Date();
+        await tx("loan_applications").insert({
+          id,
           tenant_id: input.tenantId,
-          idempotency_key: input.idempotencyKey,
-        })
-        .first<{ id: string; request_hash: string; status: string }>();
-      if (existing) {
-        if (existing.request_hash !== requestHash)
-          throw new Error("Idempotency key reused with different application");
-        return { id: existing.id, status: "SUBMITTED", replayed: true };
-      }
-      const version = await tx("loan_product_versions")
-        .where({
-          tenant_id: input.tenantId,
-          id: input.productVersionId,
-          status: "PUBLISHED",
-          is_current: true,
-          activated_for_tenant: true,
-          currency: "NGN",
-        })
-        .first<PublishedVersion>();
-      if (!version)
-        throw new Error("Published loan product version is unavailable");
-      if (
-        BigInt(input.amountMinor) < BigInt(version.min_amount) ||
-        BigInt(input.amountMinor) > BigInt(version.max_amount) ||
-        input.tenureDays < version.min_tenure_days ||
-        input.tenureDays > version.max_tenure_days
-      )
-        throw new Error("Requested terms are outside product boundaries");
-      const id = randomUUID();
-      await tx("loan_applications").insert({
-        id,
-        tenant_id: input.tenantId,
-        customer_id: input.customerId,
-        loan_product_id: version.loan_product_id,
-        loan_product_version_id: version.id,
-        application_number: `APP-${id}`,
-        requested_amount: input.amountMinor,
-        requested_tenure_days: input.tenureDays,
-        requested_interest_rate: version.interest_rate,
-        currency: "NGN",
-        status: "SUBMITTED",
-        purpose: input.purpose,
-        application_data: "{}",
-        submitted_at: tx.fn.now(),
-        idempotency_key: input.idempotencyKey,
-        request_hash: requestHash,
-        correlation_id: input.correlationId,
-        product_configuration_hash: version.configuration_hash,
-        kyc_tier: input.evidence.kycTier,
-        kyc_status: input.evidence.kycStatus,
-        kyc_verification_reference: input.evidence.kycVerificationReference,
-        affordability_input_hash: hash({
-          monthlyIncomeMinor: input.evidence.monthlyIncomeMinor,
-          existingExposureMinor: input.evidence.existingExposureMinor,
-          activeLoanCount: input.evidence.activeLoanCount,
-        }),
-        consent_reference: input.evidence.consentReference,
-        evidence_observed_at: input.evidence.evidenceObservedAt,
-        evidence_expires_at: input.evidence.evidenceExpiresAt,
-      });
-      await tx("loan_outbox_events").insert({
-        tenant_id: input.tenantId,
-        aggregate_type: "loan_application",
-        aggregate_id: id,
-        event_type: "loan.application-submitted.v1",
-        event_version: 1,
-        idempotency_key: `application:${id}:submitted`,
-        correlation_id: input.correlationId,
-        payload: {
-          application_id: id,
           customer_id: input.customerId,
-          amount_minor: input.amountMinor,
+          loan_product_id: version.loan_product_id,
+          loan_product_version_id: version.id,
+          application_number: applicationNumber,
+          requested_amount: input.amountMinor,
+          requested_tenure_days: input.tenureDays,
+          requested_interest_rate: version.interest_rate,
           currency: "NGN",
-        },
+          status: "SUBMITTED",
+          purpose: input.purpose,
+          application_data: "{}",
+          submitted_at: submittedAt,
+          idempotency_key: input.idempotencyKey,
+          request_hash: requestHash,
+          correlation_id: input.correlationId,
+          product_configuration_hash: version.configuration_hash,
+          consent_reference: input.consentReference,
+          declared_monthly_income_minor: input.declaredMonthlyIncomeMinor,
+          declared_income_source: "CUSTOMER_DECLARED",
+          income_verification_status: "UNVERIFIED",
+          underwriting_status: "PENDING_EVIDENCE",
+        });
+        await tx("loan_outbox_events").insert({
+          tenant_id: input.tenantId,
+          aggregate_type: "loan_application",
+          aggregate_id: id,
+          event_type: "loan.application-submitted.v1",
+          event_version: 1,
+          idempotency_key: `application:${id}:submitted`,
+          correlation_id: input.correlationId,
+          payload: {
+            application_id: id,
+            customer_id: input.customerId,
+            amount_minor: input.amountMinor,
+            currency: "NGN",
+          },
+        });
+        return {
+          id,
+          applicationNumber,
+          submittedAt: submittedAt.toISOString(),
+          status: "SUBMITTED" as const,
+          underwritingStatus: "PENDING_EVIDENCE" as const,
+          replayed: false,
+        };
+      },
+    );
+    if (
+      !this.eligibility ||
+      (submitted.replayed &&
+        submitted.underwritingStatus !== "PENDING_EVIDENCE")
+    )
+      return submitted;
+    try {
+      const collection = await this.collectEvidence({
+        tenantId: input.tenantId,
+        applicationId: submitted.id,
+        customerId: input.customerId,
+        consentReference: input.consentReference,
+        declaredMonthlyIncomeMinor: input.declaredMonthlyIncomeMinor,
       });
-      return { id, status: "SUBMITTED", replayed: false };
+      return {
+        ...submitted,
+        underwritingStatus: collection.status,
+      };
+    } catch {
+      return { ...submitted, underwritingStatus: "PENDING_EVIDENCE" as const };
+    }
+  }
+
+  private async collectEvidence(input: {
+    tenantId: string;
+    applicationId: string;
+    customerId: string;
+    consentReference: string;
+    declaredMonthlyIncomeMinor: string;
+  }): Promise<EvidenceCollectionResult> {
+    if (!this.eligibility) throw new Error("Eligibility gateway unavailable");
+    const auth = await this.eligibility.getLendingEligibility(input);
+    const kyc = object(auth, "kyc");
+    const risk = object(auth, "risk");
+    const consent = object(auth, "consent");
+    const exposure = await withTenantTransaction(
+      this.db,
+      input.tenantId,
+      async (tx) => {
+        const rows = await tx("loans")
+          .where({ tenant_id: input.tenantId, customer_id: input.customerId })
+          .whereIn("status", ["APPROVED", "ACTIVE", "OVERDUE", "RESTRUCTURED"])
+          .whereNull("deleted_at")
+          .select<
+            {
+              active_loan_count: number;
+              existing_exposure_minor: string;
+              maximum_days_past_due: number;
+            }[]
+          >(
+            tx.raw("count(*)::integer as active_loan_count"),
+            tx.raw(
+              "coalesce(sum(outstanding_principal + outstanding_interest + outstanding_fees + outstanding_penalties),0)::text as existing_exposure_minor",
+            ),
+            tx.raw(
+              "coalesce(max(days_past_due),0)::integer as maximum_days_past_due",
+            ),
+          );
+        const row = rows[0];
+        return {
+          activeLoanCount: Number(row?.active_loan_count ?? 0),
+          existingExposureMinor: String(row?.existing_exposure_minor ?? "0"),
+          maximumDaysPastDue: Number(row?.maximum_days_past_due ?? 0),
+        };
+      },
+    );
+    const now = new Date().toISOString();
+    const evidence: UnderwritingEvidence = {
+      kycTier: text(kyc, "tier"),
+      kycStatus: text(kyc, "status"),
+      kycVerificationReference: textOr(
+        kyc,
+        "verification_reference",
+        "unavailable",
+      ),
+      consentReference: input.consentReference,
+      evidenceObservedAt: textOr(kyc, "observed_at", now),
+      evidenceExpiresAt: textOr(
+        kyc,
+        "expires_at",
+        new Date(Date.now() + 86_400_000).toISOString(),
+      ),
+      monthlyIncomeMinor: input.declaredMonthlyIncomeMinor,
+      existingExposureMinor: exposure.existingExposureMinor,
+      activeLoanCount: exposure.activeLoanCount,
+      riskDisposition: enumRisk(risk.disposition),
+    };
+    const consentValid = consent.valid === true;
+    const collectionStatus = !consentValid
+      ? "ACTION_REQUIRED"
+      : evidence.riskDisposition === "REFER"
+        ? "ACTION_REQUIRED"
+        : "READY";
+    await withTenantTransaction(this.db, input.tenantId, async (tx) => {
+      const snapshotId = randomUUID();
+      const latestVersion = await tx("loan_underwriting_evidence_snapshots")
+        .where({
+          tenant_id: input.tenantId,
+          application_id: input.applicationId,
+        })
+        .max<{ snapshot_version: number | string | null }>(
+          "snapshot_version as snapshot_version",
+        )
+        .first();
+      const snapshotVersion = Number(latestVersion?.snapshot_version ?? 0) + 1;
+      const normalized = {
+        ...evidence,
+        maximumDaysPastDue: exposure.maximumDaysPastDue,
+        consentValid,
+      };
+      await tx("loan_underwriting_evidence_snapshots").insert({
+        id: snapshotId,
+        tenant_id: input.tenantId,
+        application_id: input.applicationId,
+        snapshot_version: snapshotVersion,
+        collection_status: collectionStatus,
+        kyc_tier: evidence.kycTier,
+        kyc_status: evidence.kycStatus,
+        kyc_verification_reference: evidence.kycVerificationReference,
+        risk_disposition: evidence.riskDisposition,
+        risk_reason_codes: JSON.stringify(
+          Array.isArray(risk.reason_codes) ? risk.reason_codes : [],
+        ),
+        consent_reference: input.consentReference,
+        consent_valid: consentValid,
+        declared_monthly_income_minor: input.declaredMonthlyIncomeMinor,
+        income_source: "CUSTOMER_DECLARED",
+        income_verification_status: "UNVERIFIED",
+        existing_exposure_minor: exposure.existingExposureMinor,
+        active_loan_count: exposure.activeLoanCount,
+        maximum_days_past_due: exposure.maximumDaysPastDue,
+        observed_at: evidence.evidenceObservedAt,
+        expires_at: evidence.evidenceExpiresAt,
+        snapshot_hash: hash(normalized),
+        collected_at: tx.fn.now(),
+      });
+      for (const source of [
+        {
+          type: "KYC",
+          service: "parc-auth-customer",
+          ref: evidence.kycVerificationReference,
+          payload: kyc,
+        },
+        {
+          type: "IDENTITY_RISK",
+          service: "parc-auth-customer",
+          ref: textOr(risk, "assessment_reference", "unavailable"),
+          payload: risk,
+        },
+        {
+          type: "CONSENT",
+          service: "parc-auth-customer",
+          ref: input.consentReference,
+          payload: consent,
+        },
+        {
+          type: "INCOME",
+          service: "customer-declaration",
+          ref: input.applicationId,
+          payload: {
+            amount_minor: input.declaredMonthlyIncomeMinor,
+            verification_status: "UNVERIFIED",
+          },
+        },
+        {
+          type: "LENDING_EXPOSURE",
+          service: "parc-lending",
+          ref: input.customerId,
+          payload: exposure,
+        },
+      ])
+        await tx("loan_underwriting_evidence_sources").insert({
+          tenant_id: input.tenantId,
+          snapshot_id: snapshotId,
+          application_id: input.applicationId,
+          evidence_type: source.type,
+          source_service: source.service,
+          source_reference: source.ref,
+          source_version: "v1",
+          outcome:
+            source.type === "CONSENT" && !consentValid
+              ? "BLOCKED"
+              : "AVAILABLE",
+          normalized_payload: JSON.stringify(source.payload),
+          payload_hash: hash(source.payload),
+          observed_at: evidence.evidenceObservedAt,
+          expires_at: evidence.evidenceExpiresAt,
+        });
+      await tx("loan_applications")
+        .where({ tenant_id: input.tenantId, id: input.applicationId })
+        .update({
+          latest_underwriting_snapshot_id: snapshotId,
+          underwriting_status:
+            collectionStatus === "READY" ? "READY" : "ACTION_REQUIRED",
+          kyc_tier: evidence.kycTier,
+          kyc_status: evidence.kycStatus,
+          kyc_verification_reference: evidence.kycVerificationReference,
+          affordability_input_hash: hash({
+            income: evidence.monthlyIncomeMinor,
+            ...exposure,
+          }),
+          evidence_observed_at: evidence.evidenceObservedAt,
+          evidence_expires_at: evidence.evidenceExpiresAt,
+        });
     });
+    return {
+      evidence,
+      status: collectionStatus,
+    };
   }
   async evaluate(input: {
     tenantId: string;
@@ -363,15 +618,23 @@ function evaluateRules(
       { tier: e.kycTier, status: e.kycStatus },
     ),
   );
-  results.push(
-    rule(
-      "FRAUD",
-      p.version,
-      !e.fraudFlag,
-      "FRAUD_REVIEW_REQUIRED",
-      e.fraudFlag,
-    ),
-  );
+  results.push({
+    code: "IDENTITY_RISK",
+    version: p.version,
+    outcome:
+      e.riskDisposition === "CLEAR"
+        ? "PASS"
+        : e.riskDisposition === "BLOCK"
+          ? "FAIL"
+          : "REFER",
+    reason:
+      e.riskDisposition === "CLEAR"
+        ? "IDENTITY_RISK_PASSED"
+        : e.riskDisposition === "BLOCK"
+          ? "IDENTITY_RISK_BLOCKED"
+          : "IDENTITY_RISK_REVIEW_REQUIRED",
+    observedHash: hash(e.riskDisposition),
+  });
   results.push(
     rule(
       "ACTIVE_LOANS",
@@ -425,7 +688,7 @@ function validateSubmission(input: {
   amountMinor: string;
   tenureDays: number;
   purpose: string;
-  evidence: UnderwritingEvidence;
+  declaredMonthlyIncomeMinor: string;
 }): void {
   if (
     !/^[1-9]\d*$/.test(input.amountMinor) ||
@@ -433,14 +696,37 @@ function validateSubmission(input: {
     input.tenureDays < 1
   )
     throw new Error("Invalid requested terms");
-  for (const value of [
-    input.evidence.monthlyIncomeMinor,
-    input.evidence.existingExposureMinor,
-  ])
+  for (const value of [input.declaredMonthlyIncomeMinor])
     if (!/^\d+$/.test(value))
       throw new Error("Affordability values must be minor-unit strings");
   if (input.purpose.trim().length < 2) throw new Error("Purpose is required");
 }
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function object(
+  value: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> {
+  const result = value[key];
+  if (!result || typeof result !== "object" || Array.isArray(result))
+    throw new Error(`Eligibility response is missing ${key}`);
+  return result as Record<string, unknown>;
+}
+function text(value: Record<string, unknown>, key: string): string {
+  const result = value[key];
+  if (typeof result !== "string")
+    throw new Error(`Eligibility response is missing ${key}`);
+  return result;
+}
+function textOr(
+  value: Record<string, unknown>,
+  key: string,
+  fallback: string,
+): string {
+  return typeof value[key] === "string" ? String(value[key]) : fallback;
+}
+function enumRisk(value: unknown): "CLEAR" | "REFER" | "BLOCK" {
+  if (value === "CLEAR" || value === "REFER" || value === "BLOCK") return value;
+  return "REFER";
 }

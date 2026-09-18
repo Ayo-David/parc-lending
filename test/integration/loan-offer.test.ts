@@ -273,7 +273,7 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
       monthlyIncomeMinor: "10000000",
       existingExposureMinor: "0",
       activeLoanCount: 0,
-      fraudFlag: false,
+      riskDisposition: "CLEAR",
     };
     const applications = new LoanApplicationService(db);
     const application = await applications.submit({
@@ -283,7 +283,8 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
       amountMinor: "1000000",
       tenureDays: 90,
       purpose: "Inventory",
-      evidence,
+      consentReference: randomUUID(),
+      declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
       idempotencyKey: "ln04-application",
       correlationId: randomUUID(),
     });

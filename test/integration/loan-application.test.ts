@@ -107,7 +107,7 @@ describeDatabase("LN-02 automated underwriting", () => {
     monthlyIncomeMinor: "10000000",
     existingExposureMinor: "0",
     activeLoanCount: 0,
-    fraudFlag: false,
+    riskDisposition: "CLEAR",
   };
   async function published(type: LoanProductType, code: string) {
     const products = new LoanProductService(db, {
@@ -175,7 +175,8 @@ describeDatabase("LN-02 automated underwriting", () => {
       amountMinor: "1000000",
       tenureDays: 30,
       purpose: "Working capital",
-      evidence,
+      consentReference: randomUUID(),
+      declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
       idempotencyKey: "application-low-risk",
       correlationId: randomUUID(),
     });
@@ -188,7 +189,8 @@ describeDatabase("LN-02 automated underwriting", () => {
           amountMinor: "1000000",
           tenureDays: 30,
           purpose: "Working capital",
-          evidence,
+          consentReference: randomUUID(),
+          declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
           idempotencyKey: "application-low-risk",
           correlationId: randomUUID(),
         })
@@ -235,7 +237,8 @@ describeDatabase("LN-02 automated underwriting", () => {
       amountMinor: "500000",
       tenureDays: 30,
       purpose: "Inventory",
-      evidence,
+      consentReference: randomUUID(),
+      declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
       idempotencyKey: "application-business",
       correlationId: randomUUID(),
     });
@@ -265,7 +268,8 @@ describeDatabase("LN-02 automated underwriting", () => {
       amountMinor: "500000",
       tenureDays: 30,
       purpose: "Inventory",
-      evidence,
+      consentReference: randomUUID(),
+      declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
       idempotencyKey: "application-manual",
       correlationId: randomUUID(),
     });

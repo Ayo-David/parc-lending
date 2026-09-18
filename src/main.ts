@@ -62,7 +62,7 @@ const financial = new FinancialHttpGateways(
   config.INTERNAL_SERVICE_TOKEN,
 );
 const product = new LoanProductService(database, internal);
-const application = new LoanApplicationService(database);
+const application = new LoanApplicationService(database, internal);
 const manual = new ManualUnderwritingService(database, internal);
 const offer = new LoanOfferService(database, internal);
 const repaymentLedger = financial.repaymentLedger();

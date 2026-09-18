@@ -115,7 +115,7 @@ const underwritingEvidence = z
     monthly_income_minor: z.string().regex(/^(0|[1-9][0-9]*)$/),
     existing_exposure_minor: z.string().regex(/^(0|[1-9][0-9]*)$/),
     active_loan_count: z.number().int().nonnegative(),
-    fraud_flag: z.boolean(),
+    risk_disposition: z.enum(["CLEAR", "REFER", "BLOCK"]),
   })
   .strict();
 const loanApplication = z
@@ -125,7 +125,8 @@ const loanApplication = z
     currency: z.literal("NGN"),
     tenure_days: z.number().int().positive(),
     purpose: z.string().min(2).max(500),
-    underwriting_evidence: underwritingEvidence,
+    declared_monthly_income_minor: z.string().regex(/^(0|[1-9][0-9]*)$/),
+    consent_reference: uuid,
     correlation_id: uuid,
   })
   .strict();
@@ -476,19 +477,36 @@ export function createApp(
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const mapped = camel(command);
-      const {
-        underwritingEvidence: evidence,
-        currency: _currency,
-        ...input
-      } = mapped;
+      const { currency: _currency, ...input } = mapped;
       void _currency;
-      const result = await handlers.submitApplication({
-        ...requestContext,
-        customerId: principal.subjectId,
-        ...input,
-        evidence,
+      const result = z
+        .object({
+          id: uuid,
+          applicationNumber: z.string(),
+          status: z.literal("SUBMITTED"),
+          underwritingStatus: z.enum([
+            "PENDING_EVIDENCE",
+            "READY",
+            "ACTION_REQUIRED",
+          ]),
+          submittedAt: z.string().datetime(),
+          replayed: z.boolean(),
+        })
+        .parse(
+          await handlers.submitApplication({
+            ...requestContext,
+            customerId: principal.subjectId,
+            ...input,
+          }),
+        );
+      res.status(202).json({
+        application_id: result.id,
+        application_number: result.applicationNumber,
+        status: result.status,
+        underwriting_status: result.underwritingStatus,
+        submitted_at: result.submittedAt,
+        replayed: result.replayed,
       });
-      res.status(202).json(result);
     }),
   );
   app.post(

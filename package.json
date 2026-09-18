@@ -15,6 +15,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "migrate:latest": "node --import tsx ./node_modules/knex/bin/cli.js --knexfile knexfile.ts migrate:latest",
+    "seed:pr01": "tsx scripts/seed-pr01.ts",
     "start": "node dist/main.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand --watchman=false",
     "typecheck": "tsc --noEmit",
