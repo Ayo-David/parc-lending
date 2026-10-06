@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
 import type { LendingApprovalGateway } from "./approval-gateway.js";
+import { DomainError } from "./domain-error.js";
 
 type Recommendation = "APPROVED" | "REJECTED" | "CONDITIONAL_APPROVAL";
 type ProposedTerms = {
@@ -28,7 +29,9 @@ export class ManualUnderwritingService {
       input.requiredAuthorityLevel < 1 ||
       input.reasonCodes.length === 0
     )
-      throw new Error("Manual review requires authority and reason codes");
+      throw new DomainError(
+        "Manual review requires authority and reason codes",
+      );
     const requestHash = hash({
       applicationId: input.applicationId,
       requiredAuthorityLevel: input.requiredAuthorityLevel,
@@ -43,7 +46,7 @@ export class ManualUnderwritingService {
         .first<{ id: string; opening_request_hash: string }>();
       if (replay) {
         if (replay.opening_request_hash !== requestHash)
-          throw new Error(
+          throw new DomainError(
             "Idempotency key reused with different manual review",
           );
         return { id: replay.id, replayed: true };
@@ -57,7 +60,7 @@ export class ManualUnderwritingService {
         .forUpdate()
         .first<{ id: string }>("id");
       if (!application)
-        throw new Error("Application is not awaiting manual review");
+        throw new DomainError("Application is not awaiting manual review");
       const existing = await tx("loan_manual_review_cases")
         .where({
           tenant_id: input.tenantId,
@@ -65,7 +68,8 @@ export class ManualUnderwritingService {
         })
         .whereIn("status", ["OPEN", "ASSIGNED", "PENDING_APPROVAL"])
         .first<{ id: string }>("id");
-      if (existing) throw new Error("An active manual review already exists");
+      if (existing)
+        throw new DomainError("An active manual review already exists");
       const id = randomUUID();
       await tx("loan_manual_review_cases").insert({
         id,
@@ -89,7 +93,7 @@ export class ManualUnderwritingService {
     idempotencyKey: string;
   }) {
     if (new Date(input.leaseUntil).getTime() <= Date.now())
-      throw new Error("Review lease must be in the future");
+      throw new DomainError("Review lease must be in the future");
     const requestHash = hash({
       reviewCaseId: input.reviewCaseId,
       reviewerId: input.reviewerId,
@@ -108,7 +112,7 @@ export class ManualUnderwritingService {
         }>();
       if (replay) {
         if (replay.request_hash !== requestHash)
-          throw new Error(
+          throw new DomainError(
             "Idempotency key reused with different manual assignment",
           );
         return { lockVersion: replay.resulting_lock_version, replayed: true };
@@ -127,7 +131,8 @@ export class ManualUnderwritingService {
           lease_expires_at: input.leaseUntil,
           lock_version: input.expectedLockVersion + 1,
         });
-      if (updated !== 1) throw new Error("Manual review assignment conflict");
+      if (updated !== 1)
+        throw new DomainError("Manual review assignment conflict");
       const lockVersion = input.expectedLockVersion + 1;
       await tx("loan_manual_review_assignments").insert({
         tenant_id: input.tenantId,
@@ -177,7 +182,7 @@ export class ManualUnderwritingService {
         .first<{ id: string; request_hash: string }>();
       if (existing) {
         if (existing.request_hash !== requestHash)
-          throw new Error(
+          throw new DomainError(
             "Idempotency key reused with different recommendation",
           );
         return { id: existing.id, payloadHash: requestHash, replayed: true };
@@ -192,7 +197,8 @@ export class ManualUnderwritingService {
         .where("lease_expires_at", ">", tx.fn.now())
         .forUpdate()
         .first<{ application_id: string }>();
-      if (!review) throw new Error("Active reviewer assignment not found");
+      if (!review)
+        throw new DomainError("Active reviewer assignment not found");
       const id = randomUUID();
       await tx("loan_manual_review_recommendations").insert({
         id,
@@ -278,7 +284,7 @@ export class ManualUnderwritingService {
           review_status: string;
         }>("r.*", "c.required_authority_level", "c.status as review_status");
       if (!recommendation)
-        throw new Error("Pending manual recommendation not found");
+        throw new DomainError("Pending manual recommendation not found");
       const decisionHash = hash({
         reviewCaseId: input.reviewCaseId,
         recommendationId: input.recommendationId,
@@ -291,13 +297,13 @@ export class ManualUnderwritingService {
       });
       if (replay) {
         if (replay.request_hash !== decisionHash)
-          throw new Error(
+          throw new DomainError(
             "Idempotency key reused with different manual decision",
           );
         return { id: replay.id, decision: replay.decision, replayed: true };
       }
       if (recommendation.review_status !== "PENDING_APPROVAL")
-        throw new Error("Manual recommendation is not pending approval");
+        throw new DomainError("Manual recommendation is not pending approval");
       const approval = await this.approvals.consume({
         tenantId: input.tenantId,
         approvalId: input.approvalId,
@@ -314,7 +320,9 @@ export class ManualUnderwritingService {
         !approval.authorityLevel ||
         !approval.consumedAt
       )
-        throw new Error("Approval response lacks verified decision evidence");
+        throw new DomainError(
+          "Approval response lacks verified decision evidence",
+        );
       const id = randomUUID();
       await tx("loan_application_decisions").insert({
         id,
@@ -412,6 +420,161 @@ export class ManualUnderwritingService {
       return { id, decision: recommendation.recommendation, replayed: false };
     });
   }
+
+  /**
+   * Satisfies or waives one condition of a conditional approval. Clearing the
+   * last pending condition finalizes the application with the proposed terms;
+   * until then the case stays PENDING_APPROVAL.
+   */
+  async resolveCondition(input: {
+    tenantId: string;
+    reviewCaseId: string;
+    conditionId: string;
+    actorId: string;
+    resolution: "SATISFIED" | "WAIVED";
+    evidenceReference?: string;
+    approvalId?: string;
+    idempotencyKey: string;
+    correlationId: string;
+  }) {
+    if (input.resolution === "SATISFIED" && !input.evidenceReference)
+      throw new DomainError("Satisfying a condition requires evidence");
+    if (input.resolution === "WAIVED" && !input.approvalId)
+      throw new DomainError("Waiving a condition requires an approval");
+    return withTenantTransaction(this.db, input.tenantId, async (tx) => {
+      const condition = await tx("loan_manual_decision_conditions as c")
+        .join("loan_application_decisions as d", function () {
+          this.on("d.recommendation_id", "=", "c.recommendation_id").andOn(
+            "d.tenant_id",
+            "=",
+            "c.tenant_id",
+          );
+        })
+        .where({
+          "c.tenant_id": input.tenantId,
+          "c.id": input.conditionId,
+          "d.review_case_id": input.reviewCaseId,
+          "d.decision": "CONDITIONAL_APPROVAL",
+        })
+        .forUpdate()
+        .first<{
+          status: "PENDING" | "SATISFIED" | "WAIVED";
+          recommendation_id: string;
+          application_id: string;
+        }>("c.status", "c.recommendation_id", "d.application_id");
+      if (!condition)
+        throw new DomainError("Conditional approval condition not found");
+      if (
+        condition.status !== "PENDING" &&
+        condition.status !== input.resolution
+      )
+        throw new DomainError("Condition has already been resolved");
+      if (condition.status === "PENDING") {
+        if (input.resolution === "WAIVED") {
+          const payloadHash = hash({
+            reviewCaseId: input.reviewCaseId,
+            conditionId: input.conditionId,
+            resolution: "WAIVED",
+          });
+          const approval = await this.approvals.consume({
+            tenantId: input.tenantId,
+            approvalId: input.approvalId!,
+            action: "MANUAL_LOAN_APPROVAL",
+            resourceType: "loan_manual_review_case",
+            resourceId: input.reviewCaseId,
+            payloadHash,
+            idempotencyKey: input.idempotencyKey,
+            correlationId: input.correlationId,
+          });
+          if (!approval.makerId || !approval.checkerIds?.length)
+            throw new DomainError(
+              "Waiver approval lacks maker-checker evidence",
+            );
+          await tx("loan_manual_decision_conditions")
+            .where({ tenant_id: input.tenantId, id: input.conditionId })
+            .update({
+              status: "WAIVED",
+              waiver_approval_id: approval.approvalId,
+              waiver_payload_hash: payloadHash,
+            });
+        } else {
+          await tx("loan_manual_decision_conditions")
+            .where({ tenant_id: input.tenantId, id: input.conditionId })
+            .update({
+              status: "SATISFIED",
+              evidence_reference: input.evidenceReference,
+              satisfied_by: input.actorId,
+              satisfied_at: tx.fn.now(),
+            });
+        }
+      }
+      const pending = await tx("loan_manual_decision_conditions")
+        .where({
+          tenant_id: input.tenantId,
+          recommendation_id: condition.recommendation_id,
+          status: "PENDING",
+        })
+        .first<{ id: string } | undefined>("id");
+      if (pending)
+        return {
+          conditionId: input.conditionId,
+          status: input.resolution,
+          finalized: false,
+        };
+      const application = await tx("loan_applications")
+        .where({ tenant_id: input.tenantId, id: condition.application_id })
+        .first<{ status: string }>("status");
+      if (application?.status === "UNDER_REVIEW") {
+        const terms = await tx("loan_manual_review_recommendations")
+          .where({ tenant_id: input.tenantId, id: condition.recommendation_id })
+          .first<{
+            proposed_amount: string;
+            proposed_tenure_days: number;
+            proposed_interest_rate: string;
+          }>(
+            "proposed_amount",
+            "proposed_tenure_days",
+            "proposed_interest_rate",
+          );
+        if (!terms) throw new DomainError("Manual recommendation not found");
+        await tx("loan_applications")
+          .where({ tenant_id: input.tenantId, id: condition.application_id })
+          .update({
+            status: "APPROVED",
+            approved_amount: terms.proposed_amount,
+            approved_tenure_days: terms.proposed_tenure_days,
+            approved_interest_rate: terms.proposed_interest_rate,
+            approved_at: tx.fn.now(),
+          });
+        await tx("loan_manual_review_cases")
+          .where({ tenant_id: input.tenantId, id: input.reviewCaseId })
+          .update({
+            status: "DECIDED",
+            decided_at: tx.fn.now(),
+            lock_version: tx.raw("lock_version + 1"),
+          });
+        await tx("loan_outbox_events").insert({
+          tenant_id: input.tenantId,
+          aggregate_type: "loan_application",
+          aggregate_id: condition.application_id,
+          event_type: "loan.manual-conditions-cleared.v1",
+          event_version: 1,
+          idempotency_key: `manual-conditions-cleared:${input.reviewCaseId}`,
+          correlation_id: input.correlationId,
+          payload: {
+            application_id: condition.application_id,
+            review_case_id: input.reviewCaseId,
+            decision: "APPROVED",
+          },
+        });
+      }
+      return {
+        conditionId: input.conditionId,
+        status: input.resolution,
+        finalized: true,
+      };
+    });
+  }
 }
 
 function validateRecommendation(input: {
@@ -421,7 +584,7 @@ function validateRecommendation(input: {
   conditions?: { code: string; description: string }[];
 }) {
   if (input.reasonCodes.length === 0)
-    throw new Error("Reason codes are required");
+    throw new DomainError("Reason codes are required");
   if (
     input.recommendation !== "REJECTED" &&
     (!input.proposedTerms ||
@@ -430,12 +593,12 @@ function validateRecommendation(input: {
       input.proposedTerms.tenureDays < 1 ||
       !/^\d+(\.\d{1,10})?$/.test(input.proposedTerms.interestRate))
   )
-    throw new Error("Valid proposed terms are required");
+    throw new DomainError("Valid proposed terms are required");
   if (
     input.recommendation === "CONDITIONAL_APPROVAL" &&
     !input.conditions?.length
   )
-    throw new Error("Conditional approval requires conditions");
+    throw new DomainError("Conditional approval requires conditions");
 }
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");

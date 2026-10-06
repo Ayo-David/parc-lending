@@ -36,6 +36,7 @@ integrationTest(
         "assignManualReview",
         "recommendManualDecision",
         "decideApplicationManually",
+        "resolveManualCondition",
         "issueOffer",
         "acceptOffer",
         "listCustomerProducts",

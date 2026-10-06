@@ -1,4 +1,5 @@
 import { Decimal } from "decimal.js";
+import { DomainError } from "./domain-error.js";
 
 export type ServicingRoundingMode = "HALF_EVEN" | "HALF_UP" | "DOWN";
 export interface InterestAccrualResult {
@@ -24,9 +25,10 @@ export function calculateInterestAccrual(input: {
     input.dayCountNumerator <= 0 ||
     input.dayCountDenominator <= 0
   )
-    throw new Error("Invalid interest-accrual inputs");
+    throw new DomainError("Invalid interest-accrual inputs");
   const rate = new Decimal(input.annualRate);
-  if (rate.isNegative()) throw new Error("Annual rate cannot be negative");
+  if (rate.isNegative())
+    throw new DomainError("Annual rate cannot be negative");
   const unrounded = new Decimal(input.openingPrincipalMinor.toString())
     .mul(rate)
     .div(100)
@@ -49,7 +51,7 @@ export function calculateDaysPastDue(input: {
   remainingAmountMinor: bigint;
 }): number {
   if (input.gracePeriodDays < 0)
-    throw new Error("Grace period cannot be negative");
+    throw new DomainError("Grace period cannot be negative");
   if (input.remainingAmountMinor <= 0n) return 0;
   const assessment = parseDate(input.assessmentDate);
   const due = parseDate(input.dueDate);
@@ -62,12 +64,12 @@ export function selectDelinquencyBucket(
   buckets: readonly { code: string; minimumDpd: number }[],
 ): string {
   if (daysPastDue < 0 || buckets.length === 0)
-    throw new Error("Invalid delinquency policy");
+    throw new DomainError("Invalid delinquency policy");
   const eligible = [...buckets]
     .sort((a, b) => a.minimumDpd - b.minimumDpd)
     .filter((bucket) => bucket.minimumDpd <= daysPastDue);
   if (!eligible.length)
-    throw new Error("Delinquency policy must include a zero-DPD bucket");
+    throw new DomainError("Delinquency policy must include a zero-DPD bucket");
   return eligible.at(-1)!.code;
 }
 
@@ -82,22 +84,22 @@ export function calculatePenalty(input: {
   compounds: false;
 }): { unroundedMinor: string; amountMinor: bigint } {
   if (input.compounds !== false)
-    throw new Error("Compounding penalties are disabled");
+    throw new DomainError("Compounding penalties are disabled");
   if (input.basisAmountMinor < 0n || input.cumulativeBeforeMinor < 0n)
-    throw new Error("Penalty values cannot be negative");
+    throw new DomainError("Penalty values cannot be negative");
   const raw =
     input.type === "FIXED"
       ? new Decimal(
           input.fixedAmountMinor?.toString() ??
             (() => {
-              throw new Error("Fixed penalty amount is required");
+              throw new DomainError("Fixed penalty amount is required");
             })(),
         )
       : new Decimal(input.basisAmountMinor.toString())
           .mul(
             input.rate ??
               (() => {
-                throw new Error("Penalty rate is required");
+                throw new DomainError("Penalty rate is required");
               })(),
           )
           .div(100);
@@ -120,8 +122,8 @@ export function calculatePenalty(input: {
 
 function parseDate(value: string): number {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value))
-    throw new Error("Date must use YYYY-MM-DD");
+    throw new DomainError("Date must use YYYY-MM-DD");
   const parsed = Date.parse(`${value}T00:00:00.000Z`);
-  if (!Number.isFinite(parsed)) throw new Error("Invalid calendar date");
+  if (!Number.isFinite(parsed)) throw new DomainError("Invalid calendar date");
   return parsed;
 }

@@ -10,6 +10,7 @@ import {
   type AccessPolicy,
 } from "./security/parc-service-auth.js";
 import { z } from "zod";
+import { DomainError } from "./services/domain-error.js";
 
 const uuid = z.string().uuid();
 const headers = z.object({
@@ -105,22 +106,7 @@ const productPublication = z
   .object({
     approval_id: uuid,
     version_id: uuid,
-    publisher_id: uuid,
     correlation_id: uuid,
-  })
-  .strict();
-const underwritingEvidence = z
-  .object({
-    kyc_tier: z.enum(["TIER_1", "TIER_2", "TIER_3"]),
-    kyc_status: z.enum(["VERIFIED", "PENDING", "RESTRICTED", "REJECTED"]),
-    kyc_verification_reference: z.string().min(1).max(255),
-    consent_reference: z.string().min(1).max(255),
-    evidence_observed_at: z.string().datetime(),
-    evidence_expires_at: z.string().datetime(),
-    monthly_income_minor: z.string().regex(/^(0|[1-9][0-9]*)$/),
-    existing_exposure_minor: z.string().regex(/^(0|[1-9][0-9]*)$/),
-    active_loan_count: z.number().int().nonnegative(),
-    risk_disposition: z.enum(["CLEAR", "REFER", "BLOCK"]),
   })
   .strict();
 const loanApplication = z
@@ -180,6 +166,14 @@ const manualDecision = z
   .object({
     recommendation_id: uuid,
     approval_id: uuid,
+    correlation_id: uuid,
+  })
+  .strict();
+const manualConditionResolution = z
+  .object({
+    resolution: z.enum(["SATISFIED", "WAIVED"]),
+    evidence_reference: z.string().min(1).max(255).optional(),
+    approval_id: uuid.optional(),
     correlation_id: uuid,
   })
   .strict();
@@ -275,7 +269,6 @@ const repayment = z.object({
 });
 const restructure = z.object({
   approval_id: uuid,
-  executor_id: uuid,
   reason_code: z.string().min(1).max(100),
   proposed_terms: z.object({
     principal_minor: z.string().regex(/^(0|[1-9][0-9]*)$/),
@@ -296,7 +289,6 @@ const restructure = z.object({
 });
 const writeOff = z.object({
   approval_id: uuid,
-  executor_id: uuid,
   reason_code: z.string().min(1).max(100),
   expense_ledger_account_id: uuid,
   receivable_ledger_account_ids: z.object({
@@ -344,6 +336,7 @@ export interface LendingCommandHandlers {
   assignManualReview(input: Record<string, unknown>): Promise<unknown>;
   recommendManualDecision(input: Record<string, unknown>): Promise<unknown>;
   decideApplicationManually(input: Record<string, unknown>): Promise<unknown>;
+  resolveManualCondition(input: Record<string, unknown>): Promise<unknown>;
   issueOffer(input: Record<string, unknown>): Promise<unknown>;
   acceptOffer(input: Record<string, unknown>): Promise<unknown>;
   listCustomerProducts(input: Record<string, unknown>): Promise<unknown>;
@@ -490,6 +483,7 @@ export function createApp(
         ...secured,
         productId: uuid.parse(req.params.id),
         ...camel(command),
+        publisherId: secured.subjectId,
       });
       res.status(200).json(result);
     }),
@@ -539,14 +533,13 @@ export function createApp(
     "/internal/v1/applications/:id/evaluate",
     access.require(lendingAccessPolicies.servicing),
     asyncRoute(async (req, res) => {
-      const evidence = underwritingEvidence.parse(req.body);
       const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
+      // Evaluation reads the collected underwriting snapshot, not request evidence.
       const result = await handlers.evaluateApplication({
         ...requestContext,
         applicationId: uuid.parse(req.params.id),
-        evidence: camel(evidence),
       });
       res.status(200).json(result);
     }),
@@ -618,6 +611,22 @@ export function createApp(
         reviewCaseId: uuid.parse(req.params.id),
         executorId: principal.subjectId,
         ...camel(command),
+      });
+      res.status(200).json(result);
+    }),
+  );
+  app.post(
+    "/v1/manual-reviews/:id/conditions/:conditionId/resolve",
+    access.require(lendingAccessPolicies.underwriting),
+    asyncRoute(async (req, res) => {
+      const command = manualConditionResolution.parse(req.body);
+      const secured = securedContext(req);
+      const result = await handlers.resolveManualCondition({
+        ...secured,
+        reviewCaseId: uuid.parse(req.params.id),
+        conditionId: uuid.parse(req.params.conditionId),
+        ...camel(command),
+        actorId: secured.subjectId,
       });
       res.status(200).json(result);
     }),
@@ -815,6 +824,7 @@ export function createApp(
         ...secured,
         loanId: uuid.parse(req.params.id),
         ...camel(command),
+        executorId: secured.subjectId,
       });
       res.status(202).json(result);
     }),
@@ -829,6 +839,7 @@ export function createApp(
         ...secured,
         loanId: uuid.parse(req.params.id),
         ...camel(command),
+        executorId: secured.subjectId,
       });
       res.status(202).json(result);
     }),
@@ -846,10 +857,20 @@ export function createApp(
         return res
           .status(400)
           .json({ code: "INVALID_REQUEST", details: error.flatten() });
-      return res.status(422).json({
-        code: "COMMAND_REJECTED",
-        message: error instanceof Error ? error.message : "Command rejected",
-      });
+      if (error instanceof DomainError)
+        return res
+          .status(422)
+          .json({ code: "COMMAND_REJECTED", message: error.message });
+      const status = httpStatus(error);
+      if (status !== undefined && status < 500)
+        return res.status(status).json({
+          code: "INVALID_REQUEST",
+          message: error instanceof Error ? error.message : "Invalid request",
+        });
+      console.error("Unhandled lending request error", error);
+      return res
+        .status(500)
+        .json({ code: "INTERNAL_ERROR", message: "Internal server error" });
     },
   );
   return app;
@@ -875,6 +896,22 @@ function assertTenant(claimTenantId: string, headerTenantId: string): void {
 }
 
 class AuthenticationError extends Error {}
+
+/** The status an HTTP-aware error (e.g. from body-parser) carries, if valid. */
+function httpStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const { status, statusCode } = error as {
+    status?: unknown;
+    statusCode?: unknown;
+  };
+  const value = typeof status === "number" ? status : statusCode;
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 400 &&
+    value <= 599
+    ? value
+    : undefined;
+}
 
 function asyncRoute(handler: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction): void => {

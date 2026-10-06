@@ -5,6 +5,10 @@ import {
   type UnderwritingEvidence,
 } from "../../src/services/loan-application-service.js";
 import {
+  deleteUnderwritingEvidence,
+  readyEligibility,
+} from "../support/underwriting-evidence.js";
+import {
   LoanProductService,
   type LoanProductType,
   type VersionTerms,
@@ -77,6 +81,7 @@ describeDatabase("LN-02 automated underwriting", () => {
       await db.raw(`ALTER TABLE public.${table} ENABLE TRIGGER ${trigger}`);
     }
     await db("loan_outbox_events").where({ tenant_id: tenantId }).delete();
+    await deleteUnderwritingEvidence(db, tenantId);
     await db("loan_applications").where({ tenant_id: tenantId }).delete();
     await db.raw(
       "ALTER TABLE public.loan_product_version_history DISABLE TRIGGER trg_protect_product_version_history",
@@ -167,7 +172,8 @@ describeDatabase("LN-02 automated underwriting", () => {
       "INSTANT",
       `INSTANT-${randomUUID().slice(0, 8)}`,
     );
-    const service = new LoanApplicationService(db);
+    const service = new LoanApplicationService(db, readyEligibility);
+    const consentReference = randomUUID();
     const submitted = await service.submit({
       tenantId,
       customerId,
@@ -175,7 +181,7 @@ describeDatabase("LN-02 automated underwriting", () => {
       amountMinor: "1000000",
       tenureDays: 30,
       purpose: "Working capital",
-      consentReference: randomUUID(),
+      consentReference,
       declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
       idempotencyKey: "application-low-risk",
       correlationId: randomUUID(),
@@ -189,7 +195,7 @@ describeDatabase("LN-02 automated underwriting", () => {
           amountMinor: "1000000",
           tenureDays: 30,
           purpose: "Working capital",
-          consentReference: randomUUID(),
+          consentReference,
           declaredMonthlyIncomeMinor: evidence.monthlyIncomeMinor,
           idempotencyKey: "application-low-risk",
           correlationId: randomUUID(),
@@ -199,7 +205,6 @@ describeDatabase("LN-02 automated underwriting", () => {
     const decision = await service.evaluate({
       tenantId,
       applicationId: submitted.id,
-      evidence,
       idempotencyKey: "evaluation-low-risk",
     });
     expect(decision.decision).toBe("APPROVED");
@@ -208,7 +213,6 @@ describeDatabase("LN-02 automated underwriting", () => {
         await service.evaluate({
           tenantId,
           applicationId: submitted.id,
-          evidence,
           idempotencyKey: "evaluation-low-risk",
         })
       ).replayed,
@@ -229,7 +233,7 @@ describeDatabase("LN-02 automated underwriting", () => {
       "BUSINESS",
       `BUSINESS-${randomUUID().slice(0, 8)}`,
     );
-    const service = new LoanApplicationService(db);
+    const service = new LoanApplicationService(db, readyEligibility);
     const submitted = await service.submit({
       tenantId,
       customerId,
@@ -246,7 +250,6 @@ describeDatabase("LN-02 automated underwriting", () => {
       service.evaluate({
         tenantId,
         applicationId: submitted.id,
-        evidence,
         idempotencyKey: "evaluation-business",
       }),
     ).resolves.toMatchObject({ decision: "REFER" });
@@ -260,7 +263,7 @@ describeDatabase("LN-02 automated underwriting", () => {
       "BUSINESS",
       `MANUAL-${randomUUID().slice(0, 8)}`,
     );
-    const applications = new LoanApplicationService(db);
+    const applications = new LoanApplicationService(db, readyEligibility);
     const submitted = await applications.submit({
       tenantId,
       customerId,
@@ -276,7 +279,6 @@ describeDatabase("LN-02 automated underwriting", () => {
     await applications.evaluate({
       tenantId,
       applicationId: submitted.id,
-      evidence,
       idempotencyKey: "evaluation-manual",
     });
     const reviewerId = randomUUID();

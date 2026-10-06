@@ -4,6 +4,10 @@ import {
   LoanApplicationService,
   type UnderwritingEvidence,
 } from "../../src/services/loan-application-service.js";
+import {
+  deleteUnderwritingEvidence,
+  readyEligibility,
+} from "../support/underwriting-evidence.js";
 import { LoanDisbursementService } from "../../src/services/loan-disbursement-service.js";
 import { CustomerLendingService } from "../../src/services/customer-lending-service.js";
 import { LoanResolutionService } from "../../src/services/loan-resolution-service.js";
@@ -157,6 +161,7 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
       .delete();
     await db("loan_application_events").where({ tenant_id: tenantId }).delete();
     await db("loan_outbox_events").where({ tenant_id: tenantId }).delete();
+    await deleteUnderwritingEvidence(db, tenantId);
     await db("loan_applications").where({ tenant_id: tenantId }).delete();
     await db("loan_product_version_history")
       .where({ tenant_id: tenantId })
@@ -275,7 +280,7 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
       activeLoanCount: 0,
       riskDisposition: "CLEAR",
     };
-    const applications = new LoanApplicationService(db);
+    const applications = new LoanApplicationService(db, readyEligibility);
     const application = await applications.submit({
       tenantId,
       customerId,
@@ -291,7 +296,6 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
     await applications.evaluate({
       tenantId,
       applicationId: application.id,
-      evidence,
       idempotencyKey: "ln04-evaluation",
     });
     const rawToken =
@@ -656,8 +660,33 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
     ).toEqual({ count: "1" });
     const restructuredBalances = await db("loans")
       .where({ id: accepted.loanId })
-      .first<{ outstanding_interest: string }>("outstanding_interest");
+      .first<{
+        outstanding_principal: string;
+        outstanding_interest: string;
+        outstanding_fees: string;
+        outstanding_penalties: string;
+      }>(
+        "outstanding_principal",
+        "outstanding_interest",
+        "outstanding_fees",
+        "outstanding_penalties",
+      );
     if (!restructuredBalances) throw new Error("Restructured loan not found");
+    // The new schedule carries principal and interest only, as the ledger posting does.
+    expect(restructuredBalances).toMatchObject({
+      outstanding_principal: "900000",
+      outstanding_fees: "0",
+      outstanding_penalties: "0",
+    });
+    expect(
+      await db("loan_installments as i")
+        .join("loan_schedules as s", "s.id", "i.schedule_id")
+        .where({ "i.loan_id": accepted.loanId, "s.is_active": false })
+        .whereRaw("i.total_paid<i.total_due")
+        .whereNot("i.status", "CANCELLED")
+        .count<{ count: string }>("*")
+        .first(),
+    ).toEqual({ count: "0" });
     const executorId = randomUUID();
     const ledgerTransactionId = randomUUID();
     let writeOffPostings = 0;
@@ -680,8 +709,8 @@ describeDatabase("LN-04 immutable offer acceptance", () => {
           expect(command.balances).toEqual({
             principal: "900000",
             interest: restructuredBalances.outstanding_interest,
-            fees: "10000",
-            penalty: "5000",
+            fees: "0",
+            penalty: "0",
           });
           return Promise.resolve({
             transactionId: ledgerTransactionId,

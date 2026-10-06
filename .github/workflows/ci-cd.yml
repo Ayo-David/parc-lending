@@ -11,6 +11,9 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   CONTAINER_NAME: parc-lending
 
+permissions:
+  contents: read
+
 jobs:
   # 1. TEST JOB
   validate:
@@ -31,8 +34,10 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/parc_lending_test
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/parc_lending_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.21.1
           cache: yarn
@@ -57,13 +62,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -71,7 +78,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -81,7 +88,7 @@ jobs:
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }},priority=100
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -105,7 +112,7 @@ jobs:
       contents: read
     steps:
       - name: Deploy to VPS via SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
           SHORT_SHA: ${{ needs.build-and-push.outputs.short_sha }}
         with:
@@ -212,11 +219,11 @@ jobs:
             # --- STEP 2: SWAP APPLICATION CONTAINERS ---
             echo "Replacing application containers..."
             stop_service
-            start_service "$IMAGE_URI"
 
             # --- STEP 3: HEALTH-CHECK THE NEW CONTAINERS, AUTO-ROLLBACK ON FAILURE ---
+            # A failed start must reach the rollback below rather than exit under set -e.
             echo "Waiting for the new containers to report ready..."
-            if wait_until_ready; then
+            if start_service "$IMAGE_URI" && wait_until_ready; then
               echo "$IMAGE_URI" > "$STATE_DIR/current_image.txt"
               echo "Deploy succeeded: $IMAGE_URI"
               docker image prune -af --filter "until=72h"

@@ -100,6 +100,8 @@ const handlers: LendingCommandHandlers = {
     manual.recommend(asInput(manual.recommend, input)),
   decideApplicationManually: (input) =>
     manual.decide(asInput(manual.decide, input)),
+  resolveManualCondition: (input) =>
+    manual.resolveCondition(asInput(manual.resolveCondition, input)),
   issueOffer: (input) => offer.issue(asInput(offer.issue, input)),
   acceptOffer: (input) => offer.accept(asInput(offer.accept, input)),
   listCustomerProducts: (input) =>

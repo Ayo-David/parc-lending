@@ -31,13 +31,21 @@ test("validates and maps the contracted disbursement command", async () => {
     publishProduct: () => Promise.resolve({}),
     submitApplication: (input) => {
       applicationReceived = input;
-      return Promise.resolve({ id: ids.loan, status: "SUBMITTED" });
+      return Promise.resolve({
+        id: ids.loan,
+        applicationNumber: `APP-${ids.loan}`,
+        status: "SUBMITTED",
+        underwritingStatus: "PENDING_EVIDENCE",
+        submittedAt: "2026-09-12T00:00:00.000Z",
+        replayed: false,
+      });
     },
     evaluateApplication: () => Promise.resolve({}),
     openManualReview: () => Promise.resolve({}),
     assignManualReview: () => Promise.resolve({}),
     recommendManualDecision: () => Promise.resolve({}),
     decideApplicationManually: () => Promise.resolve({}),
+    resolveManualCondition: () => Promise.resolve({}),
     issueOffer: () => Promise.resolve({}),
     acceptOffer: () => Promise.resolve({}),
     listCustomerProducts: () => Promise.resolve([]),
@@ -144,19 +152,9 @@ test("validates and maps the contracted disbursement command", async () => {
           currency: "NGN",
           tenure_days: 90,
           purpose: "Working capital",
+          declared_monthly_income_minor: "1000000",
+          consent_reference: ids.approval,
           correlation_id: ids.correlation,
-          underwriting_evidence: {
-            kyc_tier: "TIER_2",
-            kyc_status: "VERIFIED",
-            kyc_verification_reference: "kyc-ref",
-            consent_reference: "consent-ref",
-            evidence_observed_at: "2026-09-12T00:00:00.000Z",
-            evidence_expires_at: "2026-09-13T00:00:00.000Z",
-            monthly_income_minor: "1000000",
-            existing_exposure_minor: "0",
-            active_loan_count: 0,
-            fraud_flag: false,
-          },
         }),
       },
     );
@@ -166,10 +164,8 @@ test("validates and maps the contracted disbursement command", async () => {
       customerId: ids.executor,
       productVersionId: ids.loan,
       tenureDays: 90,
-      evidence: {
-        kycTier: "TIER_2",
-        monthlyIncomeMinor: "1000000",
-      },
+      declaredMonthlyIncomeMinor: "1000000",
+      consentReference: ids.approval,
     });
   } finally {
     server.close();
@@ -191,6 +187,7 @@ test("rejects malformed commands before invoking a handler", async () => {
       assignManualReview: handler,
       recommendManualDecision: handler,
       decideApplicationManually: handler,
+      resolveManualCondition: handler,
       issueOffer: handler,
       acceptOffer: handler,
       listCustomerProducts: handler,

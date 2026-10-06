@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
 import { generateSchedule } from "./loan-offer-service.js";
+import { DomainError } from "./domain-error.js";
 
 export interface RepaymentAuthorizationVerifier {
   verify(input: {
@@ -131,7 +132,9 @@ export class CustomerLendingService {
     );
     if (replay) {
       if (replay.request_hash !== requestHash)
-        throw new Error("Idempotency key reused with a different loan quote");
+        throw new DomainError(
+          "Idempotency key reused with a different loan quote",
+        );
       return wireLoanQuote(replay, true);
     }
     const version = await withTenantTransaction(this.db, input.tenantId, (tx) =>
@@ -147,20 +150,22 @@ export class CustomerLendingService {
         .first(),
     );
     if (!version)
-      throw new Error("Published loan product version is unavailable");
+      throw new DomainError("Published loan product version is unavailable");
     if (
       BigInt(input.amountMinor) < BigInt(version.min_amount) ||
       BigInt(input.amountMinor) > BigInt(version.max_amount) ||
       input.tenor < version.min_tenure_days ||
       input.tenor > version.max_tenure_days
     )
-      throw new Error("Requested quote is outside product boundaries");
+      throw new DomainError("Requested quote is outside product boundaries");
     const frequency = input.repaymentFrequency.toUpperCase() as
       "DAILY" | "WEEKLY" | "MONTHLY";
     if (frequency !== version.repayment_frequency)
-      throw new Error("Repayment frequency does not match the product version");
+      throw new DomainError(
+        "Repayment frequency does not match the product version",
+      );
     if (version.interest_type === "DAILY_REDUCING_BALANCE")
-      throw new Error("Daily reducing balance quoting is not enabled");
+      throw new DomainError("Daily reducing balance quoting is not enabled");
     const effectiveDate = new Date().toISOString().slice(0, 10);
     const fees = parseFees(version.fee_snapshot);
     const schedule = generateSchedule({
@@ -240,7 +245,7 @@ export class CustomerLendingService {
           id: input.applicationId,
         })
         .first();
-      if (!row) throw new Error("Customer loan application not found");
+      if (!row) throw new DomainError("Customer loan application not found");
       const decision = await tx("loan_application_decisions")
         .where({
           tenant_id: input.tenantId,
@@ -308,7 +313,8 @@ export class CustomerLendingService {
         })
         .orderBy("o.version_number", "desc")
         .first("o.*");
-      if (!offer) throw new Error("Current customer loan offer not found");
+      if (!offer)
+        throw new DomainError("Current customer loan offer not found");
       const schedule = await tx("loan_offer_schedules")
         .where({ tenant_id: input.tenantId, offer_id: offer.id })
         .first();
@@ -356,7 +362,7 @@ export class CustomerLendingService {
     );
     if (existing) {
       if (existing.request_hash !== requestHash)
-        throw new Error(
+        throw new DomainError(
           "Idempotency key reused with a different repayment quote",
         );
       return wireRepaymentQuote(existing, true);
@@ -369,10 +375,10 @@ export class CustomerLendingService {
           id: input.loanId,
           currency: "NGN",
         })
-        .whereIn("status", ["ACTIVE", "OVERDUE"])
+        .whereIn("status", ["DISBURSED", "ACTIVE", "OVERDUE"])
         .first(),
     );
-    if (!loan) throw new Error("Repayable customer loan not found");
+    if (!loan) throw new DomainError("Repayable customer loan not found");
     const snapshot = {
       penalty_minor: loan.outstanding_penalties,
       fees_minor: loan.outstanding_fees,
@@ -438,17 +444,19 @@ export class CustomerLendingService {
         .first(),
     );
     if (!quote || new Date(quote.expires_at).getTime() <= Date.now())
-      throw new Error("Current customer repayment quote not found");
+      throw new DomainError("Current customer repayment quote not found");
     if (
       ["WALLET", "DIRECT_DEBIT"].includes(quote.source) &&
       !input.authorizationToken
     )
-      throw new Error("Transaction authorization is required for this source");
+      throw new DomainError(
+        "Transaction authorization is required for this source",
+      );
     if (
       ["VIRTUAL_ACCOUNT", "MANUAL_BANK_TRANSFER"].includes(quote.source) &&
       !input.collectionReference
     )
-      throw new Error("Collection reference is required for this source");
+      throw new DomainError("Collection reference is required for this source");
     const authorization = input.authorizationToken
       ? await this.authorizations.verify({
           tenantId: input.tenantId,
@@ -459,7 +467,7 @@ export class CustomerLendingService {
         })
       : undefined;
     if (authorization && authorization.customerId !== input.customerId)
-      throw new Error("Authorization customer mismatch");
+      throw new DomainError("Authorization customer mismatch");
     const requestHash = hash({
       loanId: input.loanId,
       repaymentQuoteId: input.repaymentQuoteId,
@@ -479,35 +487,51 @@ export class CustomerLendingService {
     );
     if (existing) {
       if (existing.request_hash !== requestHash)
-        throw new Error(
+        throw new DomainError(
           "Idempotency key reused with a different repayment request",
         );
-      return {
-        id: existing.id,
-        status: existing.status,
-        paymentRequestId: existing.payment_request_id ?? null,
-        replayed: true,
-      };
+      return wireRepaymentRequest(existing, true);
     }
+    // A quote backs at most one request (uq_repayment_request_quote).
+    const forQuote = () =>
+      withTenantTransaction(this.db, input.tenantId, (tx) =>
+        tx("loan_repayment_requests")
+          .where({
+            tenant_id: input.tenantId,
+            repayment_quote_id: input.repaymentQuoteId,
+          })
+          .first(),
+      );
+    const used = await forQuote();
+    if (used) return replayQuoteRequest(used, requestHash);
     const id = randomUUID();
-    await withTenantTransaction(this.db, input.tenantId, (tx) =>
-      tx("loan_repayment_requests").insert({
-        id,
-        tenant_id: input.tenantId,
-        customer_id: input.customerId,
-        loan_id: input.loanId,
-        repayment_quote_id: input.repaymentQuoteId,
-        status: "SUBMITTING",
-        authorization_reference: authorization?.reference,
-        authorization_evidence_hash: input.authorizationToken
-          ? createHash("sha256").update(input.authorizationToken).digest("hex")
-          : undefined,
-        collection_reference: input.collectionReference,
-        payment_correlation_id: input.correlationId,
-        idempotency_key: input.idempotencyKey,
-        request_hash: requestHash,
-      }),
-    );
+    try {
+      await withTenantTransaction(this.db, input.tenantId, (tx) =>
+        tx("loan_repayment_requests").insert({
+          id,
+          tenant_id: input.tenantId,
+          customer_id: input.customerId,
+          loan_id: input.loanId,
+          repayment_quote_id: input.repaymentQuoteId,
+          status: "SUBMITTING",
+          authorization_reference: authorization?.reference,
+          authorization_evidence_hash: input.authorizationToken
+            ? createHash("sha256")
+                .update(input.authorizationToken)
+                .digest("hex")
+            : undefined,
+          collection_reference: input.collectionReference,
+          payment_correlation_id: input.correlationId,
+          idempotency_key: input.idempotencyKey,
+          request_hash: requestHash,
+        }),
+      );
+    } catch (error) {
+      if (!isUniqueViolation(error, "uq_repayment_request_quote")) throw error;
+      const raced = await forQuote();
+      if (!raced) throw error;
+      return replayQuoteRequest(raced, requestHash);
+    }
     const payment = await this.payments.initiate({
       tenantId: input.tenantId,
       customerId: input.customerId,
@@ -540,6 +564,29 @@ export class CustomerLendingService {
   }
 }
 
+function wireRepaymentRequest(
+  row: Record<string, any>,
+  replayed: boolean,
+): RepaymentRequestResult {
+  return {
+    id: row.id,
+    status: row.status,
+    paymentRequestId: row.payment_request_id ?? null,
+    replayed,
+  };
+}
+function replayQuoteRequest(
+  row: Record<string, any>,
+  requestHash: string,
+): RepaymentRequestResult {
+  if (row.request_hash !== requestHash)
+    throw new DomainError("Repayment quote has already been used");
+  return wireRepaymentRequest(row, true);
+}
+function isUniqueViolation(error: unknown, constraint: string): boolean {
+  const pg = error as { code?: unknown; constraint?: unknown } | null;
+  return pg?.code === "23505" && pg.constraint === constraint;
+}
 function parseFees(value: unknown): Array<{
   code: string;
   description: string;

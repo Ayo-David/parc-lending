@@ -14,7 +14,7 @@ export async function up(knex: Knex): Promise<void> {
       ADD COLUMN idempotency_key varchar(255), ADD COLUMN request_hash char(64), ADD COLUMN correlation_id uuid,
       ADD COLUMN retention_until date NOT NULL DEFAULT(current_date+2557), ADD COLUMN legal_hold boolean NOT NULL DEFAULT false,
       ADD CONSTRAINT uq_adjustment_tenant_id UNIQUE(tenant_id,id), ADD CONSTRAINT uq_adjustment_idempotency UNIQUE(tenant_id,idempotency_key),
-      ADD CONSTRAINT chk_adjustment_ngn CHECK(currency='NGN'), ADD CONSTRAINT chk_adjustment_approval CHECK(approval_id IS NOT NULL AND approval_payload_hash IS NOT NULL AND approval_consumed_at IS NOT NULL AND approval_maker_id IS NOT NULL AND jsonb_array_length(approval_checker_ids)>0 AND executor_id IS NOT NULL AND NOT(approval_checker_ids @> to_jsonb(ARRAY[approval_maker_id::text,executor_id::text])));
+      ADD CONSTRAINT chk_adjustment_ngn CHECK(currency='NGN'), ADD CONSTRAINT chk_adjustment_approval CHECK(approval_id IS NOT NULL AND approval_payload_hash IS NOT NULL AND approval_consumed_at IS NOT NULL AND approval_maker_id IS NOT NULL AND jsonb_array_length(approval_checker_ids)>0 AND executor_id IS NOT NULL AND executor_id<>approval_maker_id AND NOT jsonb_exists(approval_checker_ids,approval_maker_id::text) AND NOT jsonb_exists(approval_checker_ids,executor_id::text));
     ALTER TABLE public.loan_restructures
       ALTER COLUMN previous_principal TYPE bigint USING round(previous_principal*100)::bigint,
       ALTER COLUMN new_principal TYPE bigint USING round(new_principal*100)::bigint,

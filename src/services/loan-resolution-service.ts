@@ -8,6 +8,7 @@ import {
   total,
   type ComponentBalances,
 } from "./loan-resolution-calculator.js";
+import { DomainError } from "./domain-error.js";
 
 export interface ResolutionLedgerGateway {
   postWriteOff(input: {
@@ -91,7 +92,7 @@ export class LoanResolutionService {
           .first<WriteOffRow>();
         if (existing) {
           if (existing.request_hash !== requestHash)
-            throw new Error(
+            throw new DomainError(
               "Idempotency key reused with a different write-off command",
             );
           return existing;
@@ -116,7 +117,7 @@ export class LoanResolutionService {
             outstanding_penalties: "l.outstanding_penalties",
             writeoff_eligibility: "pv.writeoff_eligibility",
           });
-        if (!source) throw new Error("Write-off eligible loan not found");
+        if (!source) throw new DomainError("Write-off eligible loan not found");
         const eligibility = parseEligibility(source.writeoff_eligibility);
         const balances = balancesFrom(source);
         if (
@@ -126,7 +127,7 @@ export class LoanResolutionService {
             outstanding: balances,
           })
         )
-          throw new Error(
+          throw new DomainError(
             "Loan does not meet the published write-off eligibility policy",
           );
         const id = randomUUID();
@@ -167,7 +168,8 @@ export class LoanResolutionService {
         const created = await tx("loan_write_offs")
           .where({ tenant_id: input.tenantId, id })
           .first<WriteOffRow>();
-        if (!created) throw new Error("Write-off command was not persisted");
+        if (!created)
+          throw new DomainError("Write-off command was not persisted");
         return created;
       },
     );
@@ -201,12 +203,14 @@ export class LoanResolutionService {
       !approval.consumedAt ||
       (approval.authorityLevel ?? 0) < 2
     )
-      throw new Error("Senior maker-checker approval evidence is incomplete");
+      throw new DomainError(
+        "Senior maker-checker approval evidence is incomplete",
+      );
     const makerId = approval.makerId;
     const checkerIds = approval.checkerIds;
     const consumedAt = approval.consumedAt;
     if (makerId === input.executorId || checkerIds.includes(input.executorId))
-      throw new Error(
+      throw new DomainError(
         "Write-off executor must be separate from maker and checkers",
       );
     await withTenantTransaction(this.db, input.tenantId, async (tx) => {
@@ -316,7 +320,7 @@ export class LoanResolutionService {
     causationId: string;
   }) {
     const amount = BigInt(input.amountMinor);
-    if (amount <= 0n) throw new Error("Recovery amount must be positive");
+    if (amount <= 0n) throw new DomainError("Recovery amount must be positive");
     const requestHash = hash({
       loanId: input.loanId,
       writeOffId: input.writeOffId,
@@ -344,7 +348,7 @@ export class LoanResolutionService {
           }>();
         if (replay) {
           if (replay.request_hash !== requestHash)
-            throw new Error(
+            throw new DomainError(
               "Idempotency key reused with a different recovery command",
             );
           return replay;
@@ -363,7 +367,7 @@ export class LoanResolutionService {
             fees_amount: string;
             penalties_amount: string;
           }>();
-        if (!writeOff) throw new Error("Completed write-off not found");
+        if (!writeOff) throw new DomainError("Completed write-off not found");
         const previous = await tx("loan_write_off_recoveries")
           .where({ tenant_id: input.tenantId, write_off_id: input.writeOffId })
           .whereIn("status", ["LEDGER_POSTING", "POSTED"])
@@ -390,7 +394,7 @@ export class LoanResolutionService {
         };
         const allocation = allocateWriteoffRecovery(amount, remaining);
         if (allocation.unapplied > 0n)
-          throw new Error(
+          throw new DomainError(
             "Recovery exceeds the remaining written-off obligation",
           );
         const id = randomUUID();
@@ -458,7 +462,7 @@ export class LoanResolutionService {
           recovered_amount: tx.raw("recovered_amount+?", [input.amountMinor]),
         });
       if (changed !== 1)
-        throw new Error("Recovery exceeds the written-off obligation");
+        throw new DomainError("Recovery exceeds the written-off obligation");
       await tx("loan_outbox_events").insert({
         tenant_id: input.tenantId,
         aggregate_type: "loan_writeoff",

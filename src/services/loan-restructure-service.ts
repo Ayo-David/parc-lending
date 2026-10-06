@@ -7,6 +7,7 @@ import {
   validateRestructure,
   type ComponentBalances,
 } from "./loan-resolution-calculator.js";
+import { DomainError } from "./domain-error.js";
 
 export interface RestructureLedgerGateway {
   postRestructure(input: {
@@ -134,7 +135,7 @@ export class LoanRestructureService {
           }>();
         if (replay) {
           if (replay.request_hash !== requestHash)
-            throw new Error(
+            throw new DomainError(
               "Idempotency key reused with a different restructure command",
             );
           return replay;
@@ -220,11 +221,13 @@ export class LoanRestructureService {
       !approval.consumedAt ||
       (approval.authorityLevel ?? 0) < 2
     )
-      throw new Error("Senior maker-checker approval evidence is incomplete");
+      throw new DomainError(
+        "Senior maker-checker approval evidence is incomplete",
+      );
     const makerId = approval.makerId;
     const checkerIds = approval.checkerIds;
     if (makerId === input.executorId || checkerIds.includes(input.executorId))
-      throw new Error(
+      throw new DomainError(
         "Restructure executor must be separate from maker and checkers",
       );
     await withTenantTransaction(this.db, input.tenantId, async (tx) => {
@@ -273,7 +276,7 @@ export class LoanRestructureService {
           .where({ tenant_id: input.tenantId, id: prepared.id })
           .forUpdate()
           .first<{ status: string; new_schedule_id: string | null }>();
-        if (!current) throw new Error("Restructure command not found");
+        if (!current) throw new DomainError("Restructure command not found");
         if (current.status === "IMPLEMENTED" && current.new_schedule_id)
           return current.new_schedule_id;
         const id = randomUUID();
@@ -284,6 +287,16 @@ export class LoanRestructureService {
             is_active: true,
           })
           .update({ is_active: false });
+        // Unpaid installments of the replaced schedule are superseded so that
+        // repayment and servicing only see the new schedule's obligations.
+        await tx("loan_installments")
+          .where({
+            tenant_id: input.tenantId,
+            loan_id: input.loanId,
+            schedule_id: source.schedule_id,
+          })
+          .whereRaw("total_paid<total_due")
+          .update({ status: "CANCELLED" });
         await tx("loan_schedules").insert({
           id,
           tenant_id: input.tenantId,
@@ -327,11 +340,16 @@ export class LoanRestructureService {
             calculation_hash: item.calculationHash,
           })),
         );
+        // The new installments carry no fees or penalties; any capitalized
+        // amount is already inside the proposed principal (validateRestructure),
+        // matching the ledger's principal-plus-interest receivable.
         await tx("loans")
           .where({ tenant_id: input.tenantId, id: input.loanId })
           .update({
             outstanding_principal: input.proposedTerms.principalMinor,
             outstanding_interest: schedule.totalInterest.toString(),
+            outstanding_fees: "0",
+            outstanding_penalties: "0",
             interest_rate: input.proposedTerms.annualRate,
             tenure_days: input.proposedTerms.tenureDays,
             maturity_date: schedule.maturityDate,
@@ -415,7 +433,8 @@ export class LoanRestructureService {
           configuration_hash: "pv.configuration_hash",
         }),
     );
-    if (!row) throw new Error("Active restructure-eligible loan not found");
+    if (!row)
+      throw new DomainError("Active restructure-eligible loan not found");
     return row;
   }
 }

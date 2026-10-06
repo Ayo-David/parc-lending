@@ -20,9 +20,13 @@ interface OutboxRow {
 }
 
 export class LendingOutboxPublisher {
-  private connection?: ChannelModel;
-  private channel?: ConfirmChannel;
+  private connection: ChannelModel | undefined;
+  private channel: ConfirmChannel | undefined;
   private readonly workerId = `parc-lending:${randomUUID()}`;
+  private connecting: Promise<void> | undefined;
+  private reconnectDelayMs = 0;
+  private reconnectAt = 0;
+  private closing = false;
 
   constructor(
     private readonly db: Knex,
@@ -31,22 +35,70 @@ export class LendingOutboxPublisher {
   ) {}
 
   async connect(): Promise<void> {
-    this.connection = await amqp.connect(this.rabbitUrl);
-    this.channel = await this.connection.createConfirmChannel();
-    await this.channel.assertExchange(this.exchange, "topic", {
-      durable: true,
-    });
+    const connection = await amqp.connect(this.rabbitUrl);
+    // Drop the broken channel so the next batch reconnects instead of publishing into it.
+    const reset = () => {
+      if (this.connection === connection) {
+        this.connection = undefined;
+        this.channel = undefined;
+      }
+    };
+    connection.on("error", reset);
+    connection.on("close", reset);
+    try {
+      const channel = await connection.createConfirmChannel();
+      const resetChannel = () => {
+        if (this.channel === channel) this.channel = undefined;
+      };
+      channel.on("error", resetChannel);
+      channel.on("close", resetChannel);
+      await channel.assertExchange(this.exchange, "topic", {
+        durable: true,
+      });
+      this.connection = connection;
+      this.channel = channel;
+    } catch (error) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
   }
 
   async publishTenantBatch(tenantId: string, limit = 50): Promise<number> {
+    if (!this.channel) await this.reconnect();
     const rows = await this.claim(tenantId, limit);
     for (const row of rows) await this.publish(row);
     return rows.length;
   }
 
   async close(): Promise<void> {
-    await this.channel?.close();
-    await this.connection?.close();
+    this.closing = true;
+    await this.channel?.close().catch(() => undefined);
+    await this.connection?.close().catch(() => undefined);
+  }
+
+  /** One shared reconnect attempt, with exponential backoff after failures. */
+  private reconnect(): Promise<void> {
+    if (this.closing)
+      return Promise.reject(new Error("RabbitMQ publisher is closed"));
+    if (Date.now() < this.reconnectAt)
+      return Promise.reject(new Error("RabbitMQ publisher is reconnecting"));
+    this.connecting ??= this.connect()
+      .then(() => {
+        this.reconnectDelayMs = 0;
+        this.reconnectAt = 0;
+      })
+      .catch((error: unknown) => {
+        this.reconnectDelayMs = Math.min(
+          30_000,
+          Math.max(1_000, this.reconnectDelayMs * 2),
+        );
+        this.reconnectAt = Date.now() + this.reconnectDelayMs;
+        throw error;
+      })
+      .finally(() => {
+        this.connecting = undefined;
+      });
+    return this.connecting;
   }
 
   private claim(tenantId: string, limit: number): Promise<OutboxRow[]> {

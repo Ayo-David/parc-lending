@@ -2,6 +2,14 @@ import type { Knex } from "knex";
 
 /** Approved LENDING-DB-132 through LENDING-DB-136. */
 export async function up(knex: Knex): Promise<void> {
+  // The baseline snapshot carries no roles, so create them before any GRANT.
+  await knex.raw(`
+    DO $roles$ BEGIN
+      IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='parc_lending_runtime') THEN CREATE ROLE parc_lending_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS; END IF;
+      IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='parc_lending_worker') THEN CREATE ROLE parc_lending_worker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS; END IF;
+      IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='parc_lending_readonly') THEN CREATE ROLE parc_lending_readonly NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS; END IF;
+    END $roles$;
+  `);
   if (await knex.schema.hasTable("loan_underwriting_evidence_snapshots"))
     return;
   await knex.raw(`
@@ -79,7 +87,7 @@ export async function up(knex: Knex): Promise<void> {
     CREATE INDEX idx_underwriting_snapshot_collection ON public.loan_underwriting_evidence_snapshots(tenant_id, collection_status, created_at);
     CREATE INDEX idx_underwriting_source_application ON public.loan_underwriting_evidence_sources(tenant_id, application_id, evidence_type);
 
-    CREATE OR REPLACE FUNCTION public.protect_underwriting_evidence() RETURNS trigger LANGUAGE plpgsql AS $$
+    CREATE OR REPLACE FUNCTION public.protect_underwriting_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'underwriting evidence is immutable' USING ERRCODE='55000'; END IF;
       IF OLD.collection_status IN ('READY','ACTION_REQUIRED','FAILED') THEN
@@ -92,7 +100,7 @@ export async function up(knex: Knex): Promise<void> {
       RAISE EXCEPTION 'underwriting evidence sources are immutable' USING ERRCODE='55000';
     END $$;
     CREATE TRIGGER trg_protect_underwriting_snapshot BEFORE UPDATE OR DELETE ON public.loan_underwriting_evidence_snapshots
-      FOR EACH ROW EXECUTE FUNCTION public.protect_underwriting_evidence();
+      FOR EACH ROW EXECUTE FUNCTION public.protect_underwriting_snapshot();
     CREATE TRIGGER trg_protect_underwriting_source BEFORE UPDATE OR DELETE ON public.loan_underwriting_evidence_sources
       FOR EACH ROW EXECUTE FUNCTION public.reject_underwriting_source_change();
 

@@ -24,7 +24,7 @@ jobs:
       contents: read
     steps:
       - name: Roll back VPS deployment
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
           REQUESTED_TAG: ${{ inputs.image_tag }}
         with:
@@ -123,14 +123,25 @@ jobs:
             # application rollback never reverts schema. If the failing deploy shipped a
             # breaking migration, that needs a reviewed forward-fix migration instead.
 
-            stop_service
-            start_service "$IMAGE_URI"
+            # Remember what is running now so a failed rollback can restore it.
+            RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
 
-            if wait_until_ready; then
+            stop_service
+
+            if start_service "$IMAGE_URI" && wait_until_ready; then
               echo "$IMAGE_URI" > "$STATE_DIR/current_image.txt"
               echo "Rollback succeeded: $IMAGE_URI"
             else
               echo "Rollback containers failed readiness checks." >&2
               docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
+              stop_service
+              if [ -n "$RUNNING_IMAGE" ]; then
+                echo "Restoring previously running image: $RUNNING_IMAGE" >&2
+                if start_service "$RUNNING_IMAGE" && wait_until_ready; then
+                  echo "Previously running image restored." >&2
+                else
+                  echo "Previously running image also failed readiness checks." >&2
+                fi
+              fi
               exit 1
             fi

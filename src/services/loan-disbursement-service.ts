@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
 import type { LendingApprovalGateway } from "./approval-gateway.js";
+import { DomainError } from "./domain-error.js";
 export interface DisbursementLedgerGateway {
   post(input: {
     tenantId: string;
@@ -55,93 +56,148 @@ export class LoanDisbursementService {
     idempotencyKey: string;
     correlationId: string;
   }) {
-    const source = await withTenantTransaction(this.db, input.tenantId, (tx) =>
-      tx("loans as l")
-        .join("loan_offers as o", function () {
-          this.on("o.id", "=", "l.accepted_offer_id").andOn(
-            "o.tenant_id",
-            "=",
-            "l.tenant_id",
-          );
-        })
+    let row = await withTenantTransaction(this.db, input.tenantId, (tx) =>
+      tx("loan_disbursements")
         .where({
-          "l.tenant_id": input.tenantId,
-          "l.id": input.loanId,
-          "l.status": "APPROVED",
+          tenant_id: input.tenantId,
+          idempotency_key: input.idempotencyKey,
         })
-        .first<{ customer_id: string; amount: string }>({
-          customer_id: "l.customer_id",
-          amount: "o.net_disbursement_amount",
-        }),
+        .first<DisbursementRow>(),
     );
-    if (!source) throw new Error("Approved contracted loan not found");
-    const id = randomUUID();
-    const payloadHash = hash({
-      loanId: input.loanId,
-      destinationReference: input.destinationReference,
-      amountMinor: source.amount,
-      currency: "NGN",
-    });
-    const approval = await this.approvals.consume({
-      tenantId: input.tenantId,
-      approvalId: input.approvalId,
-      action: "LOAN_DISBURSEMENT",
-      resourceType: "loan_disbursement",
-      resourceId: id,
-      payloadHash,
-      idempotencyKey: `${input.idempotencyKey}:approval`,
-      correlationId: input.correlationId,
-    });
-    if (
-      !approval.makerId ||
-      !approval.checkerIds?.length ||
-      !approval.consumedAt
-    )
-      throw new Error("Approval evidence incomplete");
-    await withTenantTransaction(this.db, input.tenantId, (tx) =>
-      tx("loan_disbursements").insert({
+    if (row) {
+      if (
+        row.loan_id !== input.loanId ||
+        row.request_hash !==
+          payloadHashOf(input.loanId, input.destinationReference, row.amount)
+      )
+        throw new DomainError(
+          "Idempotency key reused with a different disbursement",
+        );
+    } else {
+      const source = await withTenantTransaction(
+        this.db,
+        input.tenantId,
+        (tx) =>
+          tx("loans as l")
+            .join("loan_offers as o", function () {
+              this.on("o.id", "=", "l.accepted_offer_id").andOn(
+                "o.tenant_id",
+                "=",
+                "l.tenant_id",
+              );
+            })
+            .where({
+              "l.tenant_id": input.tenantId,
+              "l.id": input.loanId,
+              "l.status": "APPROVED",
+            })
+            .first<{ amount: string }>({ amount: "o.net_disbursement_amount" }),
+      );
+      if (!source) throw new DomainError("Approved contracted loan not found");
+      // Persist first so the approval binds to a stable resource; the
+      // in-flight unique index rejects a concurrent disbursement for the loan.
+      const id = randomUUID();
+      const payloadHash = payloadHashOf(
+        input.loanId,
+        input.destinationReference,
+        source.amount,
+      );
+      row = {
         id,
-        tenant_id: input.tenantId,
         loan_id: input.loanId,
-        disbursement_reference: `DISB-${id}`,
-        destination_reference: input.destinationReference,
-        amount: source.amount,
-        currency: "NGN",
-        status: "LEDGER_POSTING",
-        approval_id: approval.approvalId,
-        approval_payload_hash: payloadHash,
-        approval_consumed_at: approval.consumedAt,
-        approval_maker_id: approval.makerId,
-        approval_checker_ids: JSON.stringify(approval.checkerIds),
-        idempotency_key: input.idempotencyKey,
+        status: "APPROVAL_PENDING",
+        amount: String(source.amount),
         request_hash: payloadHash,
-        correlation_id: input.correlationId,
-        active_step: "LEDGER_POST",
-      }),
+        ledger_transaction_id: null,
+      };
+      await withTenantTransaction(this.db, input.tenantId, (tx) =>
+        tx("loan_disbursements").insert({
+          id,
+          tenant_id: input.tenantId,
+          loan_id: input.loanId,
+          disbursement_reference: `DISB-${id}`,
+          destination_reference: input.destinationReference,
+          amount: source.amount,
+          currency: "NGN",
+          status: "APPROVAL_PENDING",
+          idempotency_key: input.idempotencyKey,
+          request_hash: payloadHash,
+          correlation_id: input.correlationId,
+          active_step: "APPROVAL",
+        }),
+      );
+    }
+    const id = row.id;
+    const amount = String(row.amount);
+    if (row.status === "APPROVAL_PENDING") {
+      const approval = await this.approvals.consume({
+        tenantId: input.tenantId,
+        approvalId: input.approvalId,
+        action: "LOAN_DISBURSEMENT",
+        resourceType: "loan_disbursement",
+        resourceId: id,
+        payloadHash: row.request_hash,
+        idempotencyKey: `${input.idempotencyKey}:approval`,
+        correlationId: input.correlationId,
+      });
+      if (
+        !approval.makerId ||
+        !approval.checkerIds?.length ||
+        !approval.consumedAt
+      )
+        throw new DomainError("Approval evidence incomplete");
+      await withTenantTransaction(this.db, input.tenantId, (tx) =>
+        tx("loan_disbursements")
+          .where({ id, tenant_id: input.tenantId, status: "APPROVAL_PENDING" })
+          .update({
+            status: "LEDGER_POSTING",
+            approval_id: approval.approvalId,
+            approval_payload_hash: row.request_hash,
+            approval_consumed_at: approval.consumedAt,
+            approval_maker_id: approval.makerId,
+            approval_checker_ids: JSON.stringify(approval.checkerIds),
+            active_step: "LEDGER_POST",
+          }),
+      );
+      row = { ...row, status: "LEDGER_POSTING" };
+    }
+    if (row.status !== "LEDGER_POSTING" && row.status !== "PAYMENT_SUBMITTING")
+      return { id, status: row.status };
+    let ledgerTransactionId = row.ledger_transaction_id;
+    if (row.status === "LEDGER_POSTING" || !ledgerTransactionId) {
+      const posting = await this.ledger.post({
+        tenantId: input.tenantId,
+        idempotencyKey: `disbursement:${id}:ledger`,
+        reference: `DISB-${id}`,
+        currency: "NGN",
+        debitAccountId: input.receivableLedgerAccountId,
+        creditAccountId: input.fundingLedgerAccountId,
+        amountMinor: amount,
+      });
+      ledgerTransactionId = posting.transactionId;
+      await withTenantTransaction(this.db, input.tenantId, (tx) =>
+        tx("loan_disbursements")
+          .where({ id, tenant_id: input.tenantId })
+          .update({
+            ledger_transaction_id: ledgerTransactionId,
+            status: "PAYMENT_SUBMITTING",
+            active_step: "PAYMENT_SUBMIT",
+          }),
+      );
+    }
+    const loan = await withTenantTransaction(this.db, input.tenantId, (tx) =>
+      tx("loans")
+        .where({ tenant_id: input.tenantId, id: input.loanId })
+        .first<{ customer_id: string }>("customer_id"),
     );
-    const posting = await this.ledger.post({
-      tenantId: input.tenantId,
-      idempotencyKey: `disbursement:${id}:ledger`,
-      reference: `DISB-${id}`,
-      currency: "NGN",
-      debitAccountId: input.receivableLedgerAccountId,
-      creditAccountId: input.fundingLedgerAccountId,
-      amountMinor: source.amount,
-    });
-    await withTenantTransaction(this.db, input.tenantId, (tx) =>
-      tx("loan_disbursements").where({ id, tenant_id: input.tenantId }).update({
-        ledger_transaction_id: posting.transactionId,
-        status: "PAYMENT_SUBMITTING",
-        active_step: "PAYMENT_SUBMIT",
-      }),
-    );
+    if (!loan) throw new DomainError("Disbursement loan not found");
     const payout = await this.payment.submit({
       tenantId: input.tenantId,
       sourceResourceId: id,
-      customerId: source.customer_id,
-      ledgerTransactionId: posting.transactionId,
+      customerId: loan.customer_id,
+      ledgerTransactionId,
       destinationReference: input.destinationReference,
-      amountMinor: source.amount,
+      amountMinor: amount,
       currency: "NGN",
       idempotencyKey: `disbursement:${id}:payment`,
       correlationId: input.correlationId,
@@ -149,7 +205,7 @@ export class LoanDisbursementService {
     if (payout.status === "FAILED") {
       const reversal = await this.ledger.reverse({
         tenantId: input.tenantId,
-        transactionId: posting.transactionId,
+        transactionId: ledgerTransactionId,
         idempotencyKey: `disbursement:${id}:reversal`,
         reason: "Final payment payout failure",
         automatedRuleId: "PRE_APPROVED_DISBURSEMENT_COMPENSATION",
@@ -179,7 +235,7 @@ export class LoanDisbursementService {
           .where({ id: input.loanId, tenant_id: input.tenantId })
           .update({
             status: "DISBURSED",
-            disbursed_amount: source.amount,
+            disbursed_amount: amount,
             disbursement_date: tx.fn.now(),
           });
         await tx("loan_outbox_events").insert({
@@ -194,8 +250,8 @@ export class LoanDisbursementService {
             loan_id: input.loanId,
             disbursement_id: id,
             payment_id: payout.paymentId,
-            ledger_transaction_id: posting.transactionId,
-            amount_minor: source.amount,
+            ledger_transaction_id: ledgerTransactionId,
+            amount_minor: amount,
             currency: "NGN",
           },
         });
@@ -203,6 +259,26 @@ export class LoanDisbursementService {
     });
     return { id, status: payout.status };
   }
+}
+interface DisbursementRow {
+  id: string;
+  loan_id: string;
+  status: string;
+  amount: string;
+  request_hash: string;
+  ledger_transaction_id: string | null;
+}
+function payloadHashOf(
+  loanId: string,
+  destinationReference: string,
+  amount: string | number,
+) {
+  return hash({
+    loanId,
+    destinationReference,
+    amountMinor: String(amount),
+    currency: "NGN",
+  });
 }
 function hash(value: unknown) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");

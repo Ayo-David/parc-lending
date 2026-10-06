@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Decimal } from "decimal.js";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
+import { DomainError } from "./domain-error.js";
 
 type Frequency =
   "DAILY" | "WEEKLY" | "BIWEEKLY" | "MONTHLY" | "QUARTERLY" | "BULLET";
@@ -59,9 +60,9 @@ export class LoanOfferService {
   }) {
     validateDate(input.effectiveDate);
     if (!/^[a-f0-9]{64}$/.test(input.documentHash))
-      throw new Error("Document hash must be SHA-256");
+      throw new DomainError("Document hash must be SHA-256");
     if (new Date(input.expiresAt).getTime() <= Date.now())
-      throw new Error("Offer expiry must be in the future");
+      throw new DomainError("Offer expiry must be in the future");
     return withTenantTransaction(this.db, input.tenantId, async (tx) => {
       const requestHash = hash({
         applicationId: input.applicationId,
@@ -78,7 +79,7 @@ export class LoanOfferService {
         .first<{ id: string; request_hash: string }>();
       if (replay) {
         if (replay.request_hash !== requestHash)
-          throw new Error("Idempotency key reused with different offer");
+          throw new DomainError("Idempotency key reused with different offer");
         return { id: replay.id, replayed: true };
       }
       const row = await tx("loan_applications as a")
@@ -100,7 +101,15 @@ export class LoanOfferService {
           "a.tenant_id": input.tenantId,
           "a.id": input.applicationId,
           "a.status": "APPROVED",
-          "d.decision": "APPROVED",
+        })
+        // A conditional approval counts once every condition is satisfied or waived.
+        .whereIn("d.decision", ["APPROVED", "CONDITIONAL_APPROVAL"])
+        .whereNotExists(function () {
+          this.select(1)
+            .from("loan_manual_decision_conditions as c")
+            .whereRaw("c.tenant_id=d.tenant_id")
+            .whereRaw("c.recommendation_id=d.recommendation_id")
+            .where("c.status", "PENDING");
         })
         .orderBy("d.decided_at", "desc")
         .forUpdate()
@@ -127,9 +136,9 @@ export class LoanOfferService {
         !row.approved_tenure_days ||
         row.approved_interest_rate === null
       )
-        throw new Error("Approved application terms are incomplete");
+        throw new DomainError("Approved application terms are incomplete");
       if (row.interest_type === "DAILY_REDUCING_BALANCE")
-        throw new Error(
+        throw new DomainError(
           "Daily reducing balance schedule generation is not enabled in LN-04",
         );
       const outstandingConditions = await tx(
@@ -150,7 +159,7 @@ export class LoanOfferService {
         .count<{ count: string }>("c.id as count")
         .first();
       if (Number(outstandingConditions?.count ?? 0) > 0)
-        throw new Error("Underwriting conditions are outstanding");
+        throw new DomainError("Underwriting conditions are outstanding");
       const fees = parseFees(row.fee_snapshot);
       const schedule = generateSchedule({
         principal: row.approved_amount,
@@ -334,7 +343,7 @@ export class LoanOfferService {
       token: input.authorizationToken,
     });
     if (authorization.customerId !== input.customerId)
-      throw new Error("Authorization customer mismatch");
+      throw new DomainError("Authorization customer mismatch");
     const authorizationHash = createHash("sha256")
       .update(input.authorizationToken)
       .digest("hex");
@@ -355,7 +364,9 @@ export class LoanOfferService {
         .first<{ id: string; offer_id: string; request_hash: string }>();
       if (replay) {
         if (replay.request_hash !== requestHash)
-          throw new Error("Idempotency key reused with different acceptance");
+          throw new DomainError(
+            "Idempotency key reused with different acceptance",
+          );
         const loan = await tx("loans")
           .where({
             tenant_id: input.tenantId,
@@ -381,19 +392,19 @@ export class LoanOfferService {
         .forUpdate()
         .first<AcceptableOffer>("o.*", "a.customer_id", "a.loan_product_id");
       if (!offer || offer.status !== "ISSUED")
-        throw new Error("Current issued offer not found");
+        throw new DomainError("Current issued offer not found");
       if (new Date(offer.expires_at).getTime() <= Date.now()) {
         await tx("loan_offers")
           .where({ id: input.offerId })
           .update({ status: "EXPIRED" });
-        throw new Error("Offer expired");
+        throw new DomainError("Offer expired");
       }
       if (offer.document_hash.trim() !== input.documentHash)
-        throw new Error("Accepted document hash mismatch");
+        throw new DomainError("Accepted document hash mismatch");
       const offerSchedule = await tx("loan_offer_schedules")
         .where({ tenant_id: input.tenantId, offer_id: input.offerId })
         .first<OfferSchedule>();
-      if (!offerSchedule) throw new Error("Offer schedule not found");
+      if (!offerSchedule) throw new DomainError("Offer schedule not found");
       const items = await tx("loan_offer_installments")
         .where({ tenant_id: input.tenantId, schedule_id: offerSchedule.id })
         .orderBy("installment_number")
@@ -735,7 +746,7 @@ function parseFees(value: unknown): FeeLine[] {
         String(fee.treatment),
       )
     )
-      throw new Error("Invalid immutable fee snapshot");
+      throw new DomainError("Invalid immutable fee snapshot");
     return {
       code: fee.code,
       description: fee.description,
@@ -789,7 +800,7 @@ function validateDate(value: string): void {
     !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
     Number.isNaN(new Date(`${value}T00:00:00.000Z`).getTime())
   )
-    throw new Error("Invalid calendar date");
+    throw new DomainError("Invalid calendar date");
 }
 function wireInstallment(item: Installment) {
   return {

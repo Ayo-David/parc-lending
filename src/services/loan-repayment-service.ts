@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
+import { DomainError } from "./domain-error.js";
 
 export type RepaymentComponent = "PENALTY" | "FEES" | "INTEREST" | "PRINCIPAL";
 export interface DueInstallment {
@@ -82,14 +83,14 @@ export function allocateRepayment(
   order: readonly RepaymentComponent[],
   installments: readonly DueInstallment[],
 ): { lines: AllocationLine[]; allocated: bigint; unapplied: bigint } {
-  if (amount <= 0n) throw new Error("Repayment amount must be positive");
+  if (amount <= 0n) throw new DomainError("Repayment amount must be positive");
   if (
     new Set(order).size !== 4 ||
     Object.keys(fields).some(
       (item) => !order.includes(item as RepaymentComponent),
     )
   )
-    throw new Error(
+    throw new DomainError(
       "Allocation order must contain every component exactly once",
     );
   let remaining = amount;
@@ -170,7 +171,9 @@ export class LoanRepaymentService {
   }) {
     const amount = BigInt(input.amountMinor);
     if (amount <= 0n || input.currency !== "NGN")
-      throw new Error("Only positive NGN minor-unit repayments are supported");
+      throw new DomainError(
+        "Only positive NGN minor-unit repayments are supported",
+      );
     const requestHash = hash({
       loanId: input.loanId,
       paymentId: input.paymentId,
@@ -189,7 +192,7 @@ export class LoanRepaymentService {
           .first()) as RepaymentRow | undefined;
         if (replay) {
           if (replay.request_hash !== requestHash)
-            throw new Error(
+            throw new DomainError(
               "Idempotency key reused with a different repayment request",
             );
           const batch = (await tx("loan_repayment_allocation_batches")
@@ -224,9 +227,10 @@ export class LoanRepaymentService {
             product_version_id: "l.loan_product_version_id",
             allocation_order: "pv.repayment_allocation_order",
           })) as unknown as LoanRow | undefined;
-        if (!loan) throw new Error("Repayable loan not found");
+        if (!loan) throw new DomainError("Repayable loan not found");
         const rows = (await tx("loan_installments")
           .where({ tenant_id: input.tenantId, loan_id: input.loanId })
+          .whereNot("status", "CANCELLED")
           .orderBy("installment_number")
           .forUpdate()) as InstallmentRow[];
         const installments: DueInstallment[] = rows.map((row) => ({
@@ -339,7 +343,7 @@ export class LoanRepaymentService {
         replayed: true,
       };
     if (!prepared.batch)
-      throw new Error("Repayment allocation batch is missing");
+      throw new DomainError("Repayment allocation batch is missing");
     const batch = prepared.batch;
     const posting = await this.ledger.post({
       tenantId: input.tenantId,
@@ -428,7 +432,7 @@ export class LoanRepaymentService {
         ],
       );
       if (updatedLoans.rowCount !== 1)
-        throw new Error(
+        throw new DomainError(
           "Loan outstanding balances do not match the repayment schedule",
         );
       if (unapplied > 0n)

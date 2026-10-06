@@ -8,6 +8,7 @@ import {
   selectDelinquencyBucket,
   type ServicingRoundingMode,
 } from "./loan-servicing-calculator.js";
+import { DomainError } from "./domain-error.js";
 
 export interface ServicingLedgerGateway {
   post(input: {
@@ -64,6 +65,54 @@ export class LoanServicingService {
     correlationId: string;
     causationId: string;
   }) {
+    const requestHash = hash({
+      loanId: input.loanId,
+      installmentId: input.installmentId,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      calculationPolicyVersion: input.calculationPolicyVersion,
+    });
+    const existing = await withTenantTransaction(
+      this.db,
+      input.tenantId,
+      (tx) =>
+        tx("loan_interest_accruals")
+          .where({
+            tenant_id: input.tenantId,
+            idempotency_key: input.idempotencyKey,
+          })
+          .first<{
+            id: string;
+            request_hash: string | null;
+            status: string;
+            interest_amount: string;
+            ledger_idempotency_key: string;
+          }>(),
+    );
+    if (existing) {
+      if (existing.request_hash && existing.request_hash !== requestHash)
+        throw new DomainError(
+          "Idempotency key reused with a different accrual",
+        );
+      if (!RETRYABLE.includes(existing.status))
+        return { id: existing.id, status: existing.status, replayed: true };
+      const posting = await this.ledger.post({
+        tenantId: input.tenantId,
+        idempotencyKey: existing.ledger_idempotency_key,
+        reference: `ACCR-${existing.id}`,
+        currency: "NGN",
+        debitAccountId: input.receivableLedgerAccountId,
+        creditAccountId: input.incomeLedgerAccountId,
+        amountMinor: String(existing.interest_amount),
+      });
+      await this.completeAccrual(
+        input,
+        existing.id,
+        String(existing.interest_amount),
+        posting.transactionId,
+      );
+      return { id: existing.id, status: "POSTED" as const, replayed: true };
+    }
     const source = await this.loanPolicy(input.tenantId, input.loanId);
     const calculation = calculateInterestAccrual({
       openingPrincipalMinor: BigInt(source.outstanding_principal),
@@ -78,27 +127,6 @@ export class LoanServicingService {
       day_count_numerator: input.dayCountNumerator,
       day_count_denominator: input.dayCountDenominator,
     };
-    const existing = await withTenantTransaction(
-      this.db,
-      input.tenantId,
-      (tx) =>
-        tx("loan_interest_accruals")
-          .where({
-            tenant_id: input.tenantId,
-            idempotency_key: input.idempotencyKey,
-          })
-          .first<{
-            id: string;
-            calculation_input_hash: string;
-            status: string;
-            ledger_transaction_id: string | null;
-          }>(),
-    );
-    if (existing) {
-      if (existing.calculation_input_hash !== hash(calculationInput))
-        throw new Error("Idempotency key reused with a different accrual");
-      return { id: existing.id, status: existing.status, replayed: true };
-    }
     const id = randomUUID();
     await withTenantTransaction(this.db, input.tenantId, (tx) =>
       tx("loan_interest_accruals").insert({
@@ -128,6 +156,7 @@ export class LoanServicingService {
         calculation_input_hash: hash(calculationInput),
         calculation_output_hash: hash(calculation),
         idempotency_key: input.idempotencyKey,
+        request_hash: requestHash,
         correlation_id: input.correlationId,
         causation_id: input.causationId,
         ledger_idempotency_key: `accrual:${id}:ledger`,
@@ -142,32 +171,45 @@ export class LoanServicingService {
       creditAccountId: input.incomeLedgerAccountId,
       amountMinor: calculation.amountMinor.toString(),
     });
-    await withTenantTransaction(this.db, input.tenantId, async (tx) => {
-      await tx("loan_interest_accruals")
+    await this.completeAccrual(
+      input,
+      id,
+      calculation.amountMinor.toString(),
+      posting.transactionId,
+    );
+    return { id, status: "POSTED" as const, replayed: posting.replayed };
+  }
+
+  /**
+   * Marks an accrual posted. The accepted schedule already put contractual
+   * interest into the loan and installment balances, so an accrual is income
+   * recognition only and must not raise what the borrower owes.
+   */
+  private completeAccrual(
+    input: {
+      tenantId: string;
+      loanId: string;
+      periodStart: string;
+      periodEnd: string;
+      correlationId: string;
+    },
+    id: string,
+    amountMinor: string,
+    ledgerTransactionId: string,
+  ) {
+    return withTenantTransaction(this.db, input.tenantId, async (tx) => {
+      const updated = await tx("loan_interest_accruals")
         .where({ tenant_id: input.tenantId, id })
+        .whereIn("status", RETRYABLE)
         .update({
           status: "POSTED",
-          ledger_transaction_id: posting.transactionId,
+          ledger_transaction_id: ledgerTransactionId,
           posted_at: tx.fn.now(),
         });
+      if (updated !== 1) return;
       await tx("loans")
         .where({ tenant_id: input.tenantId, id: input.loanId })
-        .update({
-          outstanding_interest: tx.raw("outstanding_interest+?", [
-            calculation.amountMinor.toString(),
-          ]),
-          accrued_through_date: input.periodEnd,
-        });
-      await tx("loan_installments")
-        .where({ tenant_id: input.tenantId, id: input.installmentId })
-        .update({
-          interest_due: tx.raw("interest_due+?", [
-            calculation.amountMinor.toString(),
-          ]),
-          total_due: tx.raw("total_due+?", [
-            calculation.amountMinor.toString(),
-          ]),
-        });
+        .update({ accrued_through_date: input.periodEnd });
       await this.outbox(
         tx,
         input.tenantId,
@@ -180,13 +222,12 @@ export class LoanServicingService {
           accrual_id: id,
           period_start: input.periodStart,
           period_end: input.periodEnd,
-          amount_minor: calculation.amountMinor.toString(),
+          amount_minor: amountMinor,
           currency: "NGN",
-          ledger_transaction_id: posting.transactionId,
+          ledger_transaction_id: ledgerTransactionId,
         },
       );
     });
-    return { id, status: "POSTED" as const, replayed: posting.replayed };
   }
 
   async assessDelinquency(input: {
@@ -201,6 +242,7 @@ export class LoanServicingService {
     const oldest = await withTenantTransaction(this.db, input.tenantId, (tx) =>
       tx("loan_installments")
         .where({ tenant_id: input.tenantId, loan_id: input.loanId })
+        .whereNot("status", "CANCELLED")
         .whereRaw("total_due>total_paid")
         .orderBy("due_date")
         .first<{ due_date: string; total_due: string; total_paid: string }>(),
@@ -262,7 +304,11 @@ export class LoanServicingService {
         .update({
           days_past_due: dpd,
           delinquency_bucket: bucket,
-          status: dpd > 0 ? "OVERDUE" : tx.ref("status"),
+          // Same rule as LoanRepaymentReversalService: past due is OVERDUE, cured is ACTIVE.
+          status: tx.raw(
+            "CASE WHEN ?>0 THEN 'OVERDUE'::public.loan_status_enum WHEN status='OVERDUE' THEN 'ACTIVE'::public.loan_status_enum ELSE status END",
+            [dpd],
+          ),
         });
       if (bucket !== source.delinquency_bucket)
         await this.outbox(
@@ -301,9 +347,59 @@ export class LoanServicingService {
     idempotencyKey: string;
     correlationId: string;
   }) {
+    const requestHash = hash({
+      loanId: input.loanId,
+      installmentId: input.installmentId,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      calculationPolicyVersion: input.calculationPolicyVersion,
+    });
+    const existing = await withTenantTransaction(
+      this.db,
+      input.tenantId,
+      (tx) =>
+        tx("loan_penalty_assessments")
+          .where({
+            tenant_id: input.tenantId,
+            idempotency_key: input.idempotencyKey,
+          })
+          .first<{
+            id: string;
+            request_hash: string | null;
+            status: string;
+            amount: string;
+            cumulative_before: string;
+            ledger_idempotency_key: string;
+          }>(),
+    );
+    if (existing) {
+      if (existing.request_hash && existing.request_hash !== requestHash)
+        throw new DomainError(
+          "Idempotency key reused with a different penalty assessment",
+        );
+      if (!RETRYABLE.includes(existing.status))
+        return { id: existing.id, status: existing.status, replayed: true };
+      const posting = await this.ledger.post({
+        tenantId: input.tenantId,
+        idempotencyKey: existing.ledger_idempotency_key,
+        reference: `PEN-${existing.id}`,
+        currency: "NGN",
+        debitAccountId: input.receivableLedgerAccountId,
+        creditAccountId: input.incomeLedgerAccountId,
+        amountMinor: String(existing.amount),
+      });
+      await this.completePenalty(
+        input,
+        existing.id,
+        BigInt(existing.amount),
+        BigInt(existing.cumulative_before),
+        posting.transactionId,
+      );
+      return { id: existing.id, status: "POSTED" as const, replayed: true };
+    }
     const source = await this.loanPolicy(input.tenantId, input.loanId);
     if (!source.penalty_type || !source.penalty_frequency)
-      throw new Error("Published product version has no penalty policy");
+      throw new DomainError("Published product version has no penalty policy");
     const installment = await withTenantTransaction(
       this.db,
       input.tenantId,
@@ -314,6 +410,7 @@ export class LoanServicingService {
             loan_id: input.loanId,
             id: input.installmentId,
           })
+          .whereNot("status", "CANCELLED")
           .first<{
             due_date: string;
             principal_due: string;
@@ -324,7 +421,7 @@ export class LoanServicingService {
             fees_paid: string;
           }>(),
     );
-    if (!installment) throw new Error("Loan installment not found");
+    if (!installment) throw new DomainError("Loan installment not found");
     // Penalties are excluded from their own basis: compounding remains disabled.
     const outstanding =
       BigInt(installment.principal_due) -
@@ -337,21 +434,11 @@ export class LoanServicingService {
       gracePeriodDays: source.late_payment_grace_period_days,
       remainingAmountMinor: outstanding,
     });
-    if (dpd === 0) throw new Error("Installment is not penalty eligible");
+    if (dpd === 0) throw new DomainError("Installment is not penalty eligible");
     const cumulative = await withTenantTransaction(
       this.db,
       input.tenantId,
       async (tx) => {
-        const replay = await tx("loan_penalty_assessments")
-          .where({
-            tenant_id: input.tenantId,
-            idempotency_key: input.idempotencyKey,
-          })
-          .first<{
-            id: string;
-            calculation_input_hash: string;
-            status: string;
-          }>();
         const total = await tx("loan_penalty_assessments")
           .where({
             tenant_id: input.tenantId,
@@ -360,7 +447,7 @@ export class LoanServicingService {
           })
           .sum<{ total: string | null }>("amount as total")
           .first();
-        return { replay, amount: BigInt(total?.total ?? "0") };
+        return { amount: BigInt(total?.total ?? "0") };
       },
     );
     const calculationInput = {
@@ -371,17 +458,6 @@ export class LoanServicingService {
       fixed_amount_minor: source.penalty_fixed_amount,
       cap_amount_minor: source.penalty_cap_amount,
     };
-    if (cumulative.replay) {
-      if (cumulative.replay.calculation_input_hash !== hash(calculationInput))
-        throw new Error(
-          "Idempotency key reused with a different penalty assessment",
-        );
-      return {
-        id: cumulative.replay.id,
-        status: cumulative.replay.status,
-        replayed: true,
-      };
-    }
     const calculation = calculatePenalty({
       type: source.penalty_type,
       basisAmountMinor: outstanding,
@@ -397,7 +473,7 @@ export class LoanServicingService {
       compounds: false,
     });
     if (calculation.amountMinor === 0n)
-      throw new Error("Penalty cap has been reached");
+      throw new DomainError("Penalty cap has been reached");
     const id = randomUUID();
     await withTenantTransaction(this.db, input.tenantId, (tx) =>
       tx("loan_penalty_assessments").insert({
@@ -436,6 +512,7 @@ export class LoanServicingService {
         rounding_mode: input.roundingMode,
         calculation_policy_version: input.calculationPolicyVersion,
         idempotency_key: input.idempotencyKey,
+        request_hash: requestHash,
         correlation_id: input.correlationId,
         ledger_idempotency_key: `penalty:${id}:ledger`,
       }),
@@ -449,30 +526,52 @@ export class LoanServicingService {
       creditAccountId: input.incomeLedgerAccountId,
       amountMinor: calculation.amountMinor.toString(),
     });
-    await withTenantTransaction(this.db, input.tenantId, async (tx) => {
-      await tx("loan_penalty_assessments")
+    await this.completePenalty(
+      input,
+      id,
+      calculation.amountMinor,
+      cumulative.amount,
+      posting.transactionId,
+    );
+    return { id, status: "POSTED" as const, replayed: posting.replayed };
+  }
+
+  /** Marks a penalty posted and applies it to balances exactly once. */
+  private completePenalty(
+    input: {
+      tenantId: string;
+      loanId: string;
+      installmentId: string;
+      assessmentDate: string;
+      correlationId: string;
+    },
+    id: string,
+    amountMinor: bigint,
+    cumulativeBeforeMinor: bigint,
+    ledgerTransactionId: string,
+  ) {
+    return withTenantTransaction(this.db, input.tenantId, async (tx) => {
+      const updated = await tx("loan_penalty_assessments")
         .where({ tenant_id: input.tenantId, id })
+        .whereIn("status", RETRYABLE)
         .update({
           status: "POSTED",
-          ledger_transaction_id: posting.transactionId,
+          ledger_transaction_id: ledgerTransactionId,
           posted_at: tx.fn.now(),
         });
+      if (updated !== 1) return;
       await tx("loans")
         .where({ tenant_id: input.tenantId, id: input.loanId })
         .update({
           outstanding_penalties: tx.raw("outstanding_penalties+?", [
-            calculation.amountMinor.toString(),
+            amountMinor.toString(),
           ]),
         });
       await tx("loan_installments")
         .where({ tenant_id: input.tenantId, id: input.installmentId })
         .update({
-          penalty_due: tx.raw("penalty_due+?", [
-            calculation.amountMinor.toString(),
-          ]),
-          total_due: tx.raw("total_due+?", [
-            calculation.amountMinor.toString(),
-          ]),
+          penalty_due: tx.raw("penalty_due+?", [amountMinor.toString()]),
+          total_due: tx.raw("total_due+?", [amountMinor.toString()]),
         });
       await this.outbox(
         tx,
@@ -486,16 +585,15 @@ export class LoanServicingService {
           installment_id: input.installmentId,
           penalty_assessment_id: id,
           assessment_date: input.assessmentDate,
-          amount_minor: calculation.amountMinor.toString(),
+          amount_minor: amountMinor.toString(),
           cumulative_amount_minor: (
-            cumulative.amount + calculation.amountMinor
+            cumulativeBeforeMinor + amountMinor
           ).toString(),
           currency: "NGN",
-          ledger_transaction_id: posting.transactionId,
+          ledger_transaction_id: ledgerTransactionId,
         },
       );
     });
-    return { id, status: "POSTED" as const, replayed: posting.replayed };
   }
 
   private async loanPolicy(
@@ -533,7 +631,7 @@ export class LoanServicingService {
           penalty_compounds: "pv.penalty_compounds",
         }),
     );
-    if (!row) throw new Error("Serviceable loan not found");
+    if (!row) throw new DomainError("Serviceable loan not found");
     return row;
   }
 
@@ -558,6 +656,9 @@ export class LoanServicingService {
     });
   }
 }
+
+/** Statuses whose ledger posting may be retried under the stored key. */
+const RETRYABLE = ["PENDING", "POSTING", "FAILED"];
 
 function databaseDate(value: string | Date): string {
   return value instanceof Date

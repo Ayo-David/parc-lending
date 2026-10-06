@@ -5,6 +5,7 @@ import type {
   RepaymentComponent,
   RepaymentLedgerGateway,
 } from "./loan-repayment-service.js";
+import { DomainError } from "./domain-error.js";
 
 interface Prepared {
   id: string;
@@ -31,7 +32,7 @@ export class LoanRepaymentReversalService {
     correlationId: string;
   }) {
     if (!/^[a-f0-9]{64}$/.test(input.authorityPayloadHash))
-      throw new Error("Authority payload hash must be SHA-256");
+      throw new DomainError("Authority payload hash must be SHA-256");
     const prepared = await withTenantTransaction(
       this.db,
       input.tenantId,
@@ -71,7 +72,7 @@ export class LoanRepaymentReversalService {
             existing.authority_id !== input.authorityId ||
             existing.authority_payload_hash !== input.authorityPayloadHash
           )
-            throw new Error(
+            throw new DomainError(
               "Repayment already has a different reversal command",
             );
           return existing;
@@ -89,7 +90,7 @@ export class LoanRepaymentReversalService {
             ledger_transaction_id: string;
           }>();
         if (!repayment?.ledger_transaction_id)
-          throw new Error("Successful posted repayment not found");
+          throw new DomainError("Successful posted repayment not found");
         const batch = await tx("loan_repayment_allocation_batches")
           .where({
             tenant_id: input.tenantId,
@@ -97,7 +98,8 @@ export class LoanRepaymentReversalService {
             status: "APPLIED",
           })
           .first<{ id: string }>();
-        if (!batch) throw new Error("Applied repayment allocation not found");
+        if (!batch)
+          throw new DomainError("Applied repayment allocation not found");
         const id = randomUUID();
         await tx("loan_repayment_reversals").insert({
           id,
@@ -174,12 +176,14 @@ export class LoanRepaymentReversalService {
           ],
         );
         if (changed.rowCount !== 1)
-          throw new Error("Installment balance cannot be reversed safely");
+          throw new DomainError(
+            "Installment balance cannot be reversed safely",
+          );
       }
       const batch = await tx("loan_repayment_allocation_batches")
         .where({ tenant_id: input.tenantId, id: prepared.allocation_batch_id })
         .first<{ allocated_amount: string }>();
-      if (!batch) throw new Error("Repayment allocation batch not found");
+      if (!batch) throw new DomainError("Repayment allocation batch not found");
       await tx("loan_repayment_reversals")
         .where({ tenant_id: input.tenantId, id: prepared.id })
         .update({

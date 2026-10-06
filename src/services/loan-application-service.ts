@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
+import { DomainError } from "./domain-error.js";
 
 type PublishedVersion = {
   id: string;
@@ -103,7 +104,7 @@ export class LoanApplicationService {
           }>();
         if (existing) {
           if (existing.request_hash !== requestHash)
-            throw new Error(
+            throw new DomainError(
               "Idempotency key reused with different application",
             );
           return {
@@ -126,14 +127,18 @@ export class LoanApplicationService {
           })
           .first<PublishedVersion>();
         if (!version)
-          throw new Error("Published loan product version is unavailable");
+          throw new DomainError(
+            "Published loan product version is unavailable",
+          );
         if (
           BigInt(input.amountMinor) < BigInt(version.min_amount) ||
           BigInt(input.amountMinor) > BigInt(version.max_amount) ||
           input.tenureDays < version.min_tenure_days ||
           input.tenureDays > version.max_tenure_days
         )
-          throw new Error("Requested terms are outside product boundaries");
+          throw new DomainError(
+            "Requested terms are outside product boundaries",
+          );
         const id = randomUUID();
         const applicationNumber = `APP-${id}`;
         const submittedAt = new Date();
@@ -217,7 +222,8 @@ export class LoanApplicationService {
     consentReference: string;
     declaredMonthlyIncomeMinor: string;
   }): Promise<EvidenceCollectionResult> {
-    if (!this.eligibility) throw new Error("Eligibility gateway unavailable");
+    if (!this.eligibility)
+      throw new DomainError("Eligibility gateway unavailable");
     const auth = await this.eligibility.getLendingEligibility(input);
     const kyc = object(auth, "kyc");
     const risk = object(auth, "risk");
@@ -400,15 +406,30 @@ export class LoanApplicationService {
   async evaluate(input: {
     tenantId: string;
     applicationId: string;
-    evidence: UnderwritingEvidence;
     idempotencyKey: string;
   }): Promise<{
     evaluationId: string;
     decision: "APPROVED" | "REJECTED" | "REFER";
     replayed: boolean;
   }> {
-    const inputHash = hash(input.evidence);
     return withTenantTransaction(this.db, input.tenantId, async (tx) => {
+      // Rules run only on evidence this service collected, never on caller input.
+      const snapshot = await tx("loan_underwriting_evidence_snapshots as s")
+        .join("loan_applications as a", function () {
+          this.on("a.latest_underwriting_snapshot_id", "=", "s.id").andOn(
+            "a.tenant_id",
+            "=",
+            "s.tenant_id",
+          );
+        })
+        .where({ "a.tenant_id": input.tenantId, "a.id": input.applicationId })
+        .first<SnapshotRow>("s.*");
+      if (!snapshot)
+        throw new DomainError("Underwriting evidence has not been collected");
+      if (snapshot.collection_status !== "READY")
+        throw new DomainError("Underwriting evidence is not ready");
+      const evidence = snapshotEvidence(snapshot);
+      const inputHash = hash({ snapshotId: snapshot.id, evidence });
       const existing = await tx("loan_automated_evaluations")
         .where({
           tenant_id: input.tenantId,
@@ -422,11 +443,11 @@ export class LoanApplicationService {
         }>();
       if (existing) {
         if (existing.input_hash !== inputHash)
-          throw new Error(
+          throw new DomainError(
             "Idempotency key reused with different underwriting evidence",
           );
         if (existing.status !== "COMPLETED")
-          throw new Error("Evaluation is still processing");
+          throw new DomainError("Evaluation is still processing");
         return {
           evaluationId: existing.id,
           decision: existing.outcome,
@@ -459,15 +480,16 @@ export class LoanApplicationService {
           "a.requested_amount",
           "a.requested_tenure_days",
         );
-      if (!application) throw new Error("Submitted application not found");
-      if (new Date(input.evidence.evidenceExpiresAt).getTime() <= Date.now())
-        throw new Error("Underwriting evidence is expired");
+      if (!application)
+        throw new DomainError("Submitted application not found");
+      if (new Date(evidence.evidenceExpiresAt).getTime() <= Date.now())
+        throw new DomainError("Underwriting evidence is expired");
       await tx("loan_applications")
         .where({ tenant_id: input.tenantId, id: input.applicationId })
         .update({ status: "ELIGIBILITY_CHECK" });
       const policy = parsePolicy(application.product_configuration);
       const evaluationId = randomUUID();
-      const rules = evaluateRules(application, input.evidence, policy);
+      const rules = evaluateRules(application, evidence, policy);
       const decision = rules.some((r) => r.outcome === "FAIL")
         ? "REJECTED"
         : rules.some((r) => r.outcome === "REFER") ||
@@ -565,6 +587,48 @@ export class LoanApplicationService {
       return { evaluationId, decision, replayed: false };
     });
   }
+}
+interface SnapshotRow {
+  id: string;
+  collection_status: "COLLECTING" | "READY" | "ACTION_REQUIRED" | "FAILED";
+  kyc_tier: string | null;
+  kyc_status: string | null;
+  kyc_verification_reference: string | null;
+  consent_reference: string | null;
+  risk_disposition: "CLEAR" | "REFER" | "BLOCK" | null;
+  declared_monthly_income_minor: string | null;
+  verified_monthly_income_minor: string | null;
+  existing_exposure_minor: string | null;
+  active_loan_count: number | null;
+  observed_at: Date | null;
+  expires_at: Date | null;
+}
+function snapshotEvidence(row: SnapshotRow): UnderwritingEvidence {
+  const income =
+    row.verified_monthly_income_minor ?? row.declared_monthly_income_minor;
+  if (
+    !row.kyc_tier ||
+    !row.kyc_status ||
+    !row.risk_disposition ||
+    income === null ||
+    row.existing_exposure_minor === null ||
+    row.active_loan_count === null ||
+    !row.observed_at ||
+    !row.expires_at
+  )
+    throw new DomainError("Underwriting evidence snapshot is incomplete");
+  return {
+    kycTier: row.kyc_tier,
+    kycStatus: row.kyc_status,
+    kycVerificationReference: row.kyc_verification_reference ?? "unavailable",
+    consentReference: row.consent_reference ?? "",
+    evidenceObservedAt: new Date(row.observed_at).toISOString(),
+    evidenceExpiresAt: new Date(row.expires_at).toISOString(),
+    monthlyIncomeMinor: String(income),
+    existingExposureMinor: String(row.existing_exposure_minor),
+    activeLoanCount: Number(row.active_loan_count),
+    riskDisposition: row.risk_disposition,
+  };
 }
 interface Policy {
   version: string;
@@ -680,7 +744,7 @@ function tier(value: string): number {
 }
 function parseRate(value: string): bigint {
   if (!/^(0|[1-9]\d*)(\.\d{1,10})?$/.test(value))
-    throw new Error("Invalid policy rate");
+    throw new DomainError("Invalid policy rate");
   const [whole = "0", fraction = ""] = value.split(".");
   return BigInt(whole) * 10_000_000_000n + BigInt(fraction.padEnd(10, "0"));
 }
@@ -695,11 +759,12 @@ function validateSubmission(input: {
     !Number.isInteger(input.tenureDays) ||
     input.tenureDays < 1
   )
-    throw new Error("Invalid requested terms");
+    throw new DomainError("Invalid requested terms");
   for (const value of [input.declaredMonthlyIncomeMinor])
     if (!/^\d+$/.test(value))
-      throw new Error("Affordability values must be minor-unit strings");
-  if (input.purpose.trim().length < 2) throw new Error("Purpose is required");
+      throw new DomainError("Affordability values must be minor-unit strings");
+  if (input.purpose.trim().length < 2)
+    throw new DomainError("Purpose is required");
 }
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -710,13 +775,13 @@ function object(
 ): Record<string, unknown> {
   const result = value[key];
   if (!result || typeof result !== "object" || Array.isArray(result))
-    throw new Error(`Eligibility response is missing ${key}`);
+    throw new DomainError(`Eligibility response is missing ${key}`);
   return result as Record<string, unknown>;
 }
 function text(value: Record<string, unknown>, key: string): string {
   const result = value[key];
   if (typeof result !== "string")
-    throw new Error(`Eligibility response is missing ${key}`);
+    throw new DomainError(`Eligibility response is missing ${key}`);
   return result;
 }
 function textOr(

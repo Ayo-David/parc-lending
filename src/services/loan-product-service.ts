@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { withTenantTransaction } from "../database/client.js";
 import type { LendingApprovalGateway } from "./approval-gateway.js";
+import { DomainError } from "./domain-error.js";
 
 export type LoanProductType =
   | "UNSECURED_PERSONAL"
@@ -76,7 +77,9 @@ export class LoanProductService {
         .first<{ id: string; request_hash: string }>();
       if (existing) {
         if (existing.request_hash !== requestHash)
-          throw new Error("Idempotency key reused with different product");
+          throw new DomainError(
+            "Idempotency key reused with different product",
+          );
         return { id: existing.id, replayed: true };
       }
       const id = randomUUID();
@@ -118,7 +121,9 @@ export class LoanProductService {
         .first<{ id: string; version_number: number; request_hash: string }>();
       if (existing) {
         if (existing.request_hash !== requestHash)
-          throw new Error("Idempotency key reused with different version");
+          throw new DomainError(
+            "Idempotency key reused with different version",
+          );
         return {
           id: existing.id,
           version: existing.version_number,
@@ -133,7 +138,7 @@ export class LoanProductService {
           product_name: string;
           product_type: LoanProductType;
         }>();
-      if (!product) throw new Error("Loan product not found");
+      if (!product) throw new DomainError("Loan product not found");
       const latest = await tx("loan_product_versions")
         .where({ tenant_id: input.tenantId, loan_product_id: input.productId })
         .max<{ max: string | null }>("version_number as max")
@@ -237,11 +242,11 @@ export class LoanProductService {
         })
         .first<{ id: string; status: string; configuration_hash: string }>(),
     );
-    if (!row) throw new Error("Product version not found");
+    if (!row) throw new DomainError("Product version not found");
     if (row.status === "PUBLISHED")
       return { id: row.id, status: "PUBLISHED", replayed: true };
     if (row.status !== "DRAFT" && row.status !== "PENDING_APPROVAL")
-      throw new Error("Product version cannot be published");
+      throw new DomainError("Product version cannot be published");
     const payloadHash = publicationPayloadHash({
       tenantId: input.tenantId,
       productId: input.productId,
@@ -308,25 +313,25 @@ export function publicationPayloadHash(input: {
 }
 function validateTerms(t: VersionTerms): void {
   if (t.currency !== "NGN")
-    throw new Error("Only NGN publication is operationally enabled");
+    throw new DomainError("Only NGN publication is operationally enabled");
   for (const value of [t.minAmountMinor, t.maxAmountMinor])
     if (!/^[1-9]\d*$/.test(value))
-      throw new Error("Amounts must be positive minor-unit strings");
+      throw new DomainError("Amounts must be positive minor-unit strings");
   if (BigInt(t.maxAmountMinor) < BigInt(t.minAmountMinor))
-    throw new Error("Invalid amount range");
+    throw new DomainError("Invalid amount range");
   if (!/^(0|[1-9]\d*)(\.\d{1,10})?$/.test(t.annualRate))
-    throw new Error("Rate must have at most 10 decimal places");
+    throw new DomainError("Rate must have at most 10 decimal places");
   if (
     new Set(t.allocationOrder).size !== 4 ||
     !["PENALTY", "FEES", "INTEREST", "PRINCIPAL"].every((v) =>
       t.allocationOrder.includes(v as VersionTerms["allocationOrder"][number]),
     )
   )
-    throw new Error("Allocation order must contain each component once");
+    throw new DomainError("Allocation order must contain each component once");
   if (t.interestType === "DAILY_REDUCING_BALANCE" && !t.dailyReducingEnabled)
-    throw new Error("Daily reducing balance is disabled");
+    throw new DomainError("Daily reducing balance is disabled");
   if (t.penalty?.compounds === true)
-    throw new Error(
+    throw new DomainError(
       "Compounding penalties require a later explicit policy enablement",
     );
   if (t.delinquencyBuckets) {
@@ -341,7 +346,7 @@ function validateTerms(t: VersionTerms): void {
         (bucket) => !bucket.code.trim() || bucket.minimumDpd < 0,
       )
     )
-      throw new Error(
+      throw new DomainError(
         "Delinquency buckets require unique codes and thresholds including zero DPD",
       );
   }
@@ -350,7 +355,9 @@ function validateTerms(t: VersionTerms): void {
     (!Number.isInteger(t.writeoffEligibility.minimumDpd) ||
       t.writeoffEligibility.minimumDpd < 0)
   )
-    throw new Error("Write-off minimum DPD must be a non-negative integer");
+    throw new DomainError(
+      "Write-off minimum DPD must be a non-negative integer",
+    );
 }
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
