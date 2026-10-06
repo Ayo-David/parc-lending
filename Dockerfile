@@ -19,4 +19,4 @@ RUN yarn install --frozen-lockfile --production=true && yarn cache clean
 COPY --from=build /app/dist ./dist
 USER node
 EXPOSE 3005
-CMD ["node", "dist/main.js"]
+CMD ["node", "dist/src/main.js"]

@@ -1,3 +1,4 @@
+import type { ParcTokenClient } from "../security/parc-service-auth.js";
 import type { LendingApprovalGateway } from "../services/approval-gateway.js";
 import type { RepaymentAuthorizationVerifier } from "../services/customer-lending-service.js";
 import type { TransactionAuthorizationVerifier } from "../services/loan-offer-service.js";
@@ -5,7 +6,7 @@ import type { TransactionAuthorizationVerifier } from "../services/loan-offer-se
 interface HttpClientConfig {
   authCustomerUrl: string;
   tenantAdminUrl: string;
-  serviceToken: string;
+  tokens: Pick<ParcTokenClient, "authorization">;
   timeoutMs?: number;
 }
 
@@ -28,8 +29,12 @@ export class InternalHttpClient
       `${this.config.tenantAdminUrl}/internal/v1/approvals/${input.approvalId}/consume`,
       {
         headers: {
-          "x-service-token": this.config.serviceToken,
-          "x-service-name": "parc-lending",
+          authorization: await this.config.tokens.authorization({
+            audience: "parc-tenant-admin",
+            scopes: ["tenant.approvals.consume"],
+            tenantId: input.tenantId,
+          }),
+          "x-calling-service": "parc-lending",
           "x-tenant-id": input.tenantId,
           "idempotency-key": input.idempotencyKey,
           "x-correlation-id": input.correlationId,
@@ -71,8 +76,14 @@ export class InternalHttpClient
       `${this.config.authCustomerUrl}/internal/v1/transaction-authorizations/consume`,
       {
         headers: {
-          authorization: `Bearer ${this.config.serviceToken}`,
-          "x-service-name": "parc-lending",
+          // Consuming a customer's authorization is always on that customer's behalf.
+          authorization: await this.config.tokens.authorization({
+            audience: "parc-auth-customer",
+            scopes: ["auth.transaction-authorizations.consume"],
+            tenantId: input.tenantId,
+            mode: "delegated",
+          }),
+          "x-calling-service": "parc-lending",
           "x-tenant-id": input.tenantId,
           "idempotency-key": `${input.action}:${input.resourceId}`,
         },
@@ -91,7 +102,7 @@ export class InternalHttpClient
     };
   }
 
-  public getLendingEligibility(input: {
+  public async getLendingEligibility(input: {
     tenantId: string;
     customerId: string;
     consentReference: string;
@@ -104,8 +115,12 @@ export class InternalHttpClient
       {
         method: "GET",
         headers: {
-          authorization: `Bearer ${this.config.serviceToken}`,
-          "x-service-name": "parc-lending",
+          authorization: await this.config.tokens.authorization({
+            audience: "parc-auth-customer",
+            scopes: ["auth.lending-eligibility.read"],
+            tenantId: input.tenantId,
+          }),
+          "x-calling-service": "parc-lending",
           "x-tenant-id": input.tenantId,
         },
       },

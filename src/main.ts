@@ -4,9 +4,12 @@ import type { LendingCommandHandlers } from "./app.js";
 import { createDatabase } from "./database/client.js";
 import { FinancialHttpGateways } from "./runtime/financial-http-gateways.js";
 import { InternalHttpClient } from "./runtime/internal-http-client.js";
-import { JwksLendingAuthenticator } from "./runtime/jwt-authenticator.js";
 import { LendingOutboxPublisher } from "./runtime/outbox-publisher.js";
 import { startServer } from "./server.js";
+import {
+  createParcAuth,
+  ParcTokenClient,
+} from "./security/parc-service-auth.js";
 import { CustomerLendingService } from "./services/customer-lending-service.js";
 import { LoanApplicationService } from "./services/loan-application-service.js";
 import { LoanDisbursementService } from "./services/loan-disbursement-service.js";
@@ -31,13 +34,15 @@ const config = z
       .url()
       .default("http://127.0.0.1:3001/.well-known/jwks.json"),
     AUTH_JWT_ISSUER: z.string().url().default("https://auth.parc.invalid"),
-    CUSTOMER_JWT_AUDIENCE: z.string().default("mobile-bff"),
-    ADMIN_JWT_AUDIENCE: z.string().default("admin-bff"),
-    SERVICE_JWT_AUDIENCE: z.string().default("parc-lending"),
+    AUTH_TOKEN_URL: z
+      .string()
+      .url()
+      .default("http://127.0.0.1:3001/internal/v1/oauth/token"),
+    SERVICE_CLIENT_KEY_ID: z.string().min(1),
+    SERVICE_CLIENT_PRIVATE_KEY_BASE64: z.string().min(1),
     TENANT_ADMIN_URL: z.string().url().default("http://127.0.0.1:3002"),
     LEDGER_URL: z.string().url().default("http://127.0.0.1:3003"),
     PAYMENT_URL: z.string().url().default("http://127.0.0.1:3004"),
-    INTERNAL_SERVICE_TOKEN: z.string().min(32),
     RABBITMQ_URL: z.string().url().default("amqp://127.0.0.1:5672"),
     OUTBOX_TENANT_IDS: z.string().default(""),
     OUTBOX_POLL_MS: z.coerce.number().int().min(100).default(1000),
@@ -51,15 +56,23 @@ const config = z
   .parse(process.env);
 
 const database = createDatabase(config.DATABASE_URL);
+// Outbound: short-lived tokens from Auth, authenticated with this service's key.
+const tokens = await ParcTokenClient.fromBase64Key({
+  tokenUrl: config.AUTH_TOKEN_URL,
+  issuer: config.AUTH_JWT_ISSUER,
+  clientId: "parc-lending",
+  keyId: config.SERVICE_CLIENT_KEY_ID,
+  privateKeyBase64: config.SERVICE_CLIENT_PRIVATE_KEY_BASE64,
+});
 const internal = new InternalHttpClient({
   authCustomerUrl: config.AUTH_CUSTOMER_URL,
   tenantAdminUrl: config.TENANT_ADMIN_URL,
-  serviceToken: config.INTERNAL_SERVICE_TOKEN,
+  tokens,
 });
 const financial = new FinancialHttpGateways(
   config.LEDGER_URL,
   config.PAYMENT_URL,
-  config.INTERNAL_SERVICE_TOKEN,
+  tokens,
 );
 const product = new LoanProductService(database, internal);
 const application = new LoanApplicationService(database, internal);
@@ -143,15 +156,12 @@ const handlers: LendingCommandHandlers = {
     ),
 };
 
-const authenticator = new JwksLendingAuthenticator(
-  config.AUTH_JWKS_URL,
-  config.AUTH_JWT_ISSUER,
-  {
-    CUSTOMER: config.CUSTOMER_JWT_AUDIENCE,
-    ADMIN: config.ADMIN_JWT_AUDIENCE,
-    SERVICE: config.SERVICE_JWT_AUDIENCE,
-  },
-);
+// Inbound: tokens issued for the parc-lending audience.
+const access = createParcAuth({
+  issuer: config.AUTH_JWT_ISSUER,
+  audience: "parc-lending",
+  jwksUrl: config.AUTH_JWKS_URL,
+});
 const outbox = new LendingOutboxPublisher(database, config.RABBITMQ_URL);
 await outbox.connect();
 const tenantIds = config.OUTBOX_TENANT_IDS.split(",")
@@ -173,7 +183,7 @@ const timer = setInterval(() => {
     });
 }, config.OUTBOX_POLL_MS);
 timer.unref();
-const server = startServer(handlers, authenticator, config.PORT, async () => {
+const server = startServer(handlers, access, config.PORT, async () => {
   await database.raw("SELECT 1");
 });
 

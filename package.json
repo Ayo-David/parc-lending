@@ -9,14 +9,15 @@
     "yarn": "1.22.19"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && mkdir -p dist/db/schema && cp db/schema/current.sql dist/db/schema/current.sql",
     "dev": "tsx watch src/main.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "migrate:latest": "node --import tsx ./node_modules/knex/bin/cli.js --knexfile knexfile.ts migrate:latest",
+    "migrate:runtime": "KNEX_MIGRATIONS_COMPILED=true node ./node_modules/knex/bin/cli.js --knexfile dist/knexfile.js migrate:latest",
     "seed:pr01": "tsx scripts/seed-pr01.ts",
-    "start": "node dist/main.js",
+    "start": "node dist/src/main.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand --watchman=false",
     "typecheck": "tsc --noEmit",
     "validate": "yarn format:check && yarn lint && yarn typecheck && yarn test && yarn build"

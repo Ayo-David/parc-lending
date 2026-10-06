@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import knex, { type Knex } from "knex";
 import request from "supertest";
 import { createApp, type LendingCommandHandlers } from "../../src/app.js";
+import { testAccess } from "../support/test-access.js";
 import { LoanProductService } from "../../src/services/loan-product-service.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -59,10 +60,7 @@ integrationTest(
     let readyChecks = 0;
     const app = createApp(
       handlers,
-      {
-        authenticate: () =>
-          Promise.resolve({ tenantId, subjectId: randomUUID() }),
-      },
+      testAccess({ tenantId, subjectId: randomUUID() }),
       async () => {
         readyChecks += 1;
         await database.raw("SELECT 1");

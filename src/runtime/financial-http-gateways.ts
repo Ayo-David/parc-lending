@@ -1,14 +1,26 @@
+import type { ParcTokenClient } from "../security/parc-service-auth.js";
+
 type Entry = {
   account_id: string;
   direction: "DEBIT" | "CREDIT";
   amount_minor: string;
 };
 
+interface Target {
+  url: string;
+  audience: "parc-ledger" | "parc-payment";
+  scope: string;
+}
+
+/**
+ * Ledger and Payment calls carry Auth-issued tokens: delegated while serving a
+ * customer or administrator request, service-only for background work.
+ */
 export class FinancialHttpGateways {
   public constructor(
     private readonly ledgerUrl: string,
     private readonly paymentUrl: string,
-    private readonly serviceToken: string,
+    private readonly tokens: Pick<ParcTokenClient, "authorization">,
     private readonly timeoutMs = 5_000,
   ) {}
 
@@ -212,7 +224,11 @@ export class FinancialHttpGateways {
         correlationId: string;
       }) => {
         const result = await this.post(
-          this.paymentUrl,
+          {
+            url: this.paymentUrl,
+            audience: "parc-payment",
+            scope: "payment.payouts.write",
+          },
           "/internal/v1/service-payouts",
           input.tenantId,
           input.idempotencyKey,
@@ -252,7 +268,11 @@ export class FinancialHttpGateways {
         correlationId: string;
       }) => {
         const result = await this.post(
-          this.paymentUrl,
+          {
+            url: this.paymentUrl,
+            audience: "parc-payment",
+            scope: "payment.collections.write",
+          },
           "/internal/v1/service-collections",
           input.tenantId,
           input.idempotencyKey,
@@ -289,7 +309,7 @@ export class FinancialHttpGateways {
     entries: Entry[],
   ): Promise<{ transactionId: string; replayed: boolean }> {
     const result = await this.post(
-      this.ledgerUrl,
+      this.ledger("ledger.postings.write"),
       "/internal/v1/postings",
       input.tenantId,
       input.idempotencyKey,
@@ -313,7 +333,7 @@ export class FinancialHttpGateways {
     authorityId: string;
   }): Promise<{ transactionId: string; replayed: boolean }> {
     const result = await this.post(
-      this.ledgerUrl,
+      this.ledger("ledger.reversals.write"),
       `/internal/v1/transactions/${input.transactionId}/reversals`,
       input.tenantId,
       input.idempotencyKey,
@@ -329,17 +349,24 @@ export class FinancialHttpGateways {
       replayed: result.replayed === true,
     };
   }
+  private ledger(scope: string): Target {
+    return { url: this.ledgerUrl, audience: "parc-ledger", scope };
+  }
   private async post(
-    base: string,
+    target: Target,
     path: string,
     tenantId: string,
     idempotencyKey: string,
     body: object,
   ): Promise<Record<string, unknown>> {
-    const response = await fetch(`${base}${path}`, {
+    const response = await fetch(`${target.url}${path}`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${this.serviceToken}`,
+        authorization: await this.tokens.authorization({
+          audience: target.audience,
+          scopes: [target.scope],
+          tenantId,
+        }),
         "content-type": "application/json",
         "x-tenant-id": tenantId,
         "idempotency-key": idempotencyKey,

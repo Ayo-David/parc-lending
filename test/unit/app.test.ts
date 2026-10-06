@@ -2,6 +2,7 @@ import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import { jest } from "@jest/globals";
 import { createApp, type LendingCommandHandlers } from "../../src/app.js";
+import { testAccess } from "../support/test-access.js";
 
 const ids = {
   tenant: "11111111-1111-4111-8111-111111111111",
@@ -12,10 +13,10 @@ const ids = {
   receivable: "66666666-6666-4666-8666-666666666666",
   funding: "77777777-7777-4777-8777-777777777777",
 };
-const authenticator = {
-  authenticate: () =>
-    Promise.resolve({ tenantId: ids.tenant, subjectId: ids.executor }),
-};
+const authenticator = testAccess({
+  tenantId: ids.tenant,
+  subjectId: ids.executor,
+});
 
 test("validates and maps the contracted disbursement command", async () => {
   let received: Record<string, unknown> | undefined;

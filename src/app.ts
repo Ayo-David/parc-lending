@@ -1,9 +1,14 @@
 import express, {
   type NextFunction,
   type Request,
+  type RequestHandler,
   type Response,
 } from "express";
 import helmet from "helmet";
+import {
+  principalOf,
+  type AccessPolicy,
+} from "./security/parc-service-auth.js";
 import { z } from "zod";
 
 const uuid = z.string().uuid();
@@ -356,12 +361,37 @@ export interface LendingCommandHandlers {
   reverseRepayment(input: Record<string, unknown>): Promise<unknown>;
 }
 
-export interface LendingAuthenticator {
-  authenticate(input: {
-    authorization: string;
-    audience: "CUSTOMER" | "ADMIN" | "SERVICE";
-  }): Promise<{ tenantId: string; subjectId: string }>;
+/** Inbound Auth-issued token validation (see parc-service-auth). */
+export interface LendingAccess {
+  require(policy: AccessPolicy): RequestHandler;
 }
+
+const administrator = (scope: string): AccessPolicy => ({
+  scopes: [scope],
+  kinds: ["delegated"],
+  subjectTypes: ["ADMINISTRATOR"],
+  actors: ["parc-admin-bff"],
+});
+const customer = (scope: string): AccessPolicy => ({
+  scopes: [scope],
+  kinds: ["delegated"],
+  subjectTypes: ["CUSTOMER"],
+  actors: ["parc-mobile-bff"],
+});
+
+/** Lending endpoint permissions: the user and acting service from one token. */
+export const lendingAccessPolicies = {
+  customerRead: customer("lending.customer.read"),
+  customerWrite: customer("lending.customer.write"),
+  products: administrator("lending.products.manage"),
+  underwriting: administrator("lending.underwriting.manage"),
+  loans: administrator("lending.loans.manage"),
+  /** Background servicing: a service token, or an administrator delegation. */
+  servicing: {
+    scopes: ["lending.servicing.process"],
+    subjectTypes: ["ADMINISTRATOR"],
+  },
+} satisfies Record<string, AccessPolicy>;
 
 function context(req: Request) {
   return headers.parse({
@@ -370,12 +400,8 @@ function context(req: Request) {
   });
 }
 
-async function customerContext(
-  req: Request,
-  authenticator: LendingAuthenticator,
-  requiresIdempotency: boolean,
-) {
-  const principal = await authenticate(req, authenticator, "CUSTOMER");
+function customerContext(req: Request, requiresIdempotency: boolean) {
+  const principal = authenticated(req);
   const tenantId = uuid.parse(req.header("x-tenant-id"));
   assertTenant(principal.tenantId, tenantId);
   return {
@@ -393,12 +419,8 @@ async function customerContext(
   };
 }
 
-async function securedContext(
-  req: Request,
-  authenticator: LendingAuthenticator,
-  audience: "ADMIN" | "SERVICE",
-) {
-  const principal = await authenticate(req, authenticator, audience);
+function securedContext(req: Request) {
+  const principal = authenticated(req);
   const requestContext = context(req);
   assertTenant(principal.tenantId, requestContext.tenantId);
   return { ...requestContext, subjectId: principal.subjectId };
@@ -406,7 +428,7 @@ async function securedContext(
 
 export function createApp(
   handlers: LendingCommandHandlers,
-  authenticator: LendingAuthenticator,
+  access: LendingAccess,
   readiness?: () => Promise<void>,
 ) {
   const app = express();
@@ -424,9 +446,10 @@ export function createApp(
 
   app.post(
     "/v1/loan-products",
+    access.require(lendingAccessPolicies.products),
     asyncRoute(async (req, res) => {
       const command = loanProduct.parse(req.body);
-      const secured = await securedContext(req, authenticator, "ADMIN");
+      const secured = securedContext(req);
       const result = await handlers.createProduct({
         ...secured,
         code: command.code,
@@ -441,9 +464,10 @@ export function createApp(
   );
   app.post(
     "/v1/loan-products/:id/versions",
+    access.require(lendingAccessPolicies.products),
     asyncRoute(async (req, res) => {
       const command = productVersion.parse(req.body);
-      const secured = await securedContext(req, authenticator, "ADMIN");
+      const secured = securedContext(req);
       const { effective_from: effectiveFrom, ...rawTerms } = command;
       const mapped = camel(rawTerms);
       const { interestMethod, ...terms } = mapped;
@@ -458,9 +482,10 @@ export function createApp(
   );
   app.post(
     "/v1/loan-products/:id/publish",
+    access.require(lendingAccessPolicies.products),
     asyncRoute(async (req, res) => {
       const command = productPublication.parse(req.body);
-      const secured = await securedContext(req, authenticator, "ADMIN");
+      const secured = securedContext(req);
       const result = await handlers.publishProduct({
         ...secured,
         productId: uuid.parse(req.params.id),
@@ -471,9 +496,10 @@ export function createApp(
   );
   app.post(
     "/v1/loan-applications",
+    access.require(lendingAccessPolicies.customerWrite),
     asyncRoute(async (req, res) => {
       const command = loanApplication.parse(req.body);
-      const principal = await authenticate(req, authenticator, "CUSTOMER");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const mapped = camel(command);
@@ -511,9 +537,10 @@ export function createApp(
   );
   app.post(
     "/internal/v1/applications/:id/evaluate",
+    access.require(lendingAccessPolicies.servicing),
     asyncRoute(async (req, res) => {
       const evidence = underwritingEvidence.parse(req.body);
-      const principal = await authenticate(req, authenticator, "SERVICE");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const result = await handlers.evaluateApplication({
@@ -526,9 +553,10 @@ export function createApp(
   );
   app.post(
     "/v1/applications/:id/manual-reviews",
+    access.require(lendingAccessPolicies.underwriting),
     asyncRoute(async (req, res) => {
       const command = manualReview.parse(req.body);
-      const principal = await authenticate(req, authenticator, "ADMIN");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const result = await handlers.openManualReview({
@@ -541,9 +569,10 @@ export function createApp(
   );
   app.post(
     "/v1/manual-reviews/:id/assign",
+    access.require(lendingAccessPolicies.underwriting),
     asyncRoute(async (req, res) => {
       const command = manualAssignment.parse(req.body);
-      const principal = await authenticate(req, authenticator, "ADMIN");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const result = await handlers.assignManualReview({
@@ -557,9 +586,10 @@ export function createApp(
   );
   app.post(
     "/v1/manual-reviews/:id/recommendations",
+    access.require(lendingAccessPolicies.underwriting),
     asyncRoute(async (req, res) => {
       const command = manualRecommendation.parse(req.body);
-      const principal = await authenticate(req, authenticator, "ADMIN");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const mapped = camel(command);
@@ -577,9 +607,10 @@ export function createApp(
   );
   app.post(
     "/v1/manual-reviews/:id/decisions",
+    access.require(lendingAccessPolicies.underwriting),
     asyncRoute(async (req, res) => {
       const command = manualDecision.parse(req.body);
-      const principal = await authenticate(req, authenticator, "ADMIN");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const result = await handlers.decideApplicationManually({
@@ -593,9 +624,10 @@ export function createApp(
   );
   app.post(
     "/v1/applications/:id/offers",
+    access.require(lendingAccessPolicies.underwriting),
     asyncRoute(async (req, res) => {
       const command = loanOffer.parse(req.body);
-      const principal = await authenticate(req, authenticator, "ADMIN");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const result = await handlers.issueOffer({
@@ -609,9 +641,10 @@ export function createApp(
   );
   app.post(
     "/v1/customer/loan-offers/:id/accept",
+    access.require(lendingAccessPolicies.customerWrite),
     asyncRoute(async (req, res) => {
       const command = loanOfferAcceptance.parse(req.body);
-      const principal = await authenticate(req, authenticator, "CUSTOMER");
+      const principal = authenticated(req);
       const requestContext = context(req);
       assertTenant(principal.tenantId, requestContext.tenantId);
       const mapped = camel(command);
@@ -629,15 +662,17 @@ export function createApp(
   );
   app.get(
     "/v1/customer/loan-products",
+    access.require(lendingAccessPolicies.customerRead),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, false);
+      const customer = customerContext(req, false);
       res.status(200).json(await handlers.listCustomerProducts(customer));
     }),
   );
   app.post(
     "/v1/customer/loan-quotes",
+    access.require(lendingAccessPolicies.customerRead),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, true);
+      const customer = customerContext(req, true);
       const command = customerLoanQuote.parse(req.body);
       res
         .status(200)
@@ -648,8 +683,9 @@ export function createApp(
   );
   app.get(
     "/v1/customer/loan-applications/:id",
+    access.require(lendingAccessPolicies.customerRead),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, false);
+      const customer = customerContext(req, false);
       res.status(200).json(
         await handlers.getCustomerApplication({
           ...customer,
@@ -660,8 +696,9 @@ export function createApp(
   );
   app.get(
     "/v1/customer/loan-applications/:id/offer",
+    access.require(lendingAccessPolicies.customerRead),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, false);
+      const customer = customerContext(req, false);
       res.status(200).json(
         await handlers.getCustomerOffer({
           ...customer,
@@ -672,15 +709,17 @@ export function createApp(
   );
   app.get(
     "/v1/customer/loans",
+    access.require(lendingAccessPolicies.customerRead),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, false);
+      const customer = customerContext(req, false);
       res.status(200).json(await handlers.listCustomerLoans(customer));
     }),
   );
   app.post(
     "/v1/customer/loans/:id/repayment-quotes",
+    access.require(lendingAccessPolicies.customerRead),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, true);
+      const customer = customerContext(req, true);
       const command = repaymentQuote.parse(req.body);
       res.status(200).json(
         await handlers.quoteCustomerRepayment({
@@ -694,8 +733,9 @@ export function createApp(
   );
   app.post(
     "/v1/customer/loans/:id/repayments",
+    access.require(lendingAccessPolicies.customerWrite),
     asyncRoute(async (req, res) => {
-      const customer = await customerContext(req, authenticator, true);
+      const customer = customerContext(req, true);
       const command = customerRepayment.parse(req.body);
       const mapped = camel(command);
       const { transactionAuthorizationToken: authorizationToken, ...input } =
@@ -713,9 +753,10 @@ export function createApp(
 
   app.post(
     "/internal/v1/loans/:id/disburse",
+    access.require(lendingAccessPolicies.servicing),
     asyncRoute(async (req, res) => {
       const command = disbursement.parse(req.body);
-      const secured = await securedContext(req, authenticator, "SERVICE");
+      const secured = securedContext(req);
       const result = await handlers.disburse({
         ...secured,
         loanId: uuid.parse(req.params.id),
@@ -726,9 +767,10 @@ export function createApp(
   );
   app.post(
     "/internal/v1/write-off-recoveries",
+    access.require(lendingAccessPolicies.servicing),
     asyncRoute(async (req, res) => {
       const command = writeOffRecovery.parse(req.body);
-      const secured = await securedContext(req, authenticator, "SERVICE");
+      const secured = securedContext(req);
       const result = await handlers.postWriteOffRecovery({
         ...secured,
         ...camel(command),
@@ -738,9 +780,10 @@ export function createApp(
   );
   app.post(
     "/internal/v1/repayments/:id/reverse",
+    access.require(lendingAccessPolicies.servicing),
     asyncRoute(async (req, res) => {
       const command = repaymentReversal.parse(req.body);
-      const secured = await securedContext(req, authenticator, "SERVICE");
+      const secured = securedContext(req);
       const result = await handlers.reverseRepayment({
         ...secured,
         repaymentId: uuid.parse(req.params.id),
@@ -751,9 +794,10 @@ export function createApp(
   );
   app.post(
     "/internal/v2/repayments",
+    access.require(lendingAccessPolicies.servicing),
     asyncRoute(async (req, res) => {
       const command = repayment.parse(req.body);
-      const secured = await securedContext(req, authenticator, "SERVICE");
+      const secured = securedContext(req);
       const result = await handlers.recordRepayment({
         ...secured,
         ...camel(command),
@@ -763,9 +807,10 @@ export function createApp(
   );
   app.post(
     "/v1/loans/:id/restructures",
+    access.require(lendingAccessPolicies.loans),
     asyncRoute(async (req, res) => {
       const command = restructure.parse(req.body);
-      const secured = await securedContext(req, authenticator, "ADMIN");
+      const secured = securedContext(req);
       const result = await handlers.restructure({
         ...secured,
         loanId: uuid.parse(req.params.id),
@@ -776,9 +821,10 @@ export function createApp(
   );
   app.post(
     "/v1/loans/:id/write-offs",
+    access.require(lendingAccessPolicies.loans),
     asyncRoute(async (req, res) => {
       const command = writeOff.parse(req.body);
-      const secured = await securedContext(req, authenticator, "ADMIN");
+      const secured = securedContext(req);
       const result = await handlers.writeOff({
         ...secured,
         loanId: uuid.parse(req.params.id),
@@ -809,15 +855,18 @@ export function createApp(
   return app;
 }
 
-async function authenticate(
-  req: Request,
-  authenticator: LendingAuthenticator,
-  audience: "CUSTOMER" | "ADMIN" | "SERVICE",
-) {
-  const authorization = req.header("authorization");
-  if (!authorization?.startsWith("Bearer "))
-    throw new AuthenticationError("Bearer access token is required");
-  return authenticator.authenticate({ authorization, audience });
+/**
+ * The tenant and acting user from the validated token; service tokens act as
+ * the calling service. The route's access policy has already authorized it.
+ */
+function authenticated(req: Request): { tenantId: string; subjectId: string } {
+  const principal = principalOf(req);
+  if (principal.tenantId === null)
+    throw new AuthenticationError("A tenant-bound token is required");
+  return {
+    tenantId: principal.tenantId,
+    subjectId: principal.subject?.id ?? principal.client,
+  };
 }
 
 function assertTenant(claimTenantId: string, headerTenantId: string): void {
