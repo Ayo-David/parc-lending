@@ -80,9 +80,14 @@ export async function up(knex: Knex): Promise<void> {
     );
 
     ALTER TABLE public.loan_applications ADD COLUMN latest_underwriting_snapshot_id uuid;
+    -- FK validation scans loan_applications with row_security=off, which FORCE RLS
+    -- rejects even for the owner. Lift FORCE for the validation only; the migration
+    -- transaction restores it before commit.
+    ALTER TABLE public.loan_applications NO FORCE ROW LEVEL SECURITY;
     ALTER TABLE public.loan_applications ADD CONSTRAINT fk_application_underwriting_snapshot
       FOREIGN KEY (tenant_id, latest_underwriting_snapshot_id)
       REFERENCES public.loan_underwriting_evidence_snapshots(tenant_id, id);
+    ALTER TABLE public.loan_applications FORCE ROW LEVEL SECURITY;
 
     CREATE INDEX idx_underwriting_snapshot_collection ON public.loan_underwriting_evidence_snapshots(tenant_id, collection_status, created_at);
     CREATE INDEX idx_underwriting_source_application ON public.loan_underwriting_evidence_sources(tenant_id, application_id, evidence_type);
