@@ -27,7 +27,7 @@ const config = z
       .enum(["development", "test", "production"])
       .default("development"),
     PORT: z.coerce.number().int().positive().default(3005),
-    DATABASE_URL: z.string().default("postgresql:///parc_lending"),
+    DATABASE_URL: z.string().trim().default("postgresql:///parc_lending"),
     AUTH_CUSTOMER_URL: z.string().url().default("http://127.0.0.1:3001"),
     AUTH_JWKS_URL: z
       .string()
